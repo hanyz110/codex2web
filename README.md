@@ -154,6 +154,8 @@ npm run spec:gate
 11. [Contributing](CONTRIBUTING.md)
 12. [Security Policy](SECURITY.md)
 13. [Changelog](CHANGELOG.md)
+14. [GitHub Issue Templates](.github/ISSUE_TEMPLATE)
+15. [Pull Request Template](.github/pull_request_template.md)
 
 ## Repository Standards
 
@@ -161,6 +163,7 @@ npm run spec:gate
 2. contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
 3. security policy: [SECURITY.md](SECURITY.md)
 4. example environment variables: [.env.example](.env.example)
+5. code owners: [.github/CODEOWNERS](.github/CODEOWNERS)
 
 ## Known Constraints
 
