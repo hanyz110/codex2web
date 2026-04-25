@@ -3,8 +3,7 @@
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import process from "node:process";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -75,6 +74,11 @@ function resolveNamedTunnelOptions(args) {
     process.env.CODEX2WEB_CLOUDFLARE_CREDENTIALS_FILE ||
     process.env.CODEX2WEB_CF_CREDENTIALS_FILE ||
     "";
+  const configFile =
+    args["config-file"] ||
+    process.env.CODEX2WEB_CLOUDFLARE_CONFIG_FILE ||
+    process.env.CODEX2WEB_CF_CONFIG_FILE ||
+    "";
   const useNamedTunnel =
     args["named-tunnel"] === "true" ||
     process.env.CODEX2WEB_NAMED_TUNNEL === "true" ||
@@ -82,6 +86,7 @@ function resolveNamedTunnelOptions(args) {
 
   return {
     credentialsFile,
+    configFile,
     hostname,
     tunnelId,
     tunnelName,
@@ -89,9 +94,20 @@ function resolveNamedTunnelOptions(args) {
   };
 }
 
-async function createNamedTunnelConfig({ credentialsFile, hostname, port, tunnelId }) {
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex2web-cloudflared-"));
-  const configPath = path.join(tempDir, "config.yml");
+function safeFileSegment(value) {
+  return String(value || "default")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "default";
+}
+
+async function createNamedTunnelConfig({ configFile, credentialsFile, hostname, port, tunnelId, tunnelName }) {
+  const configPath = configFile
+    ? path.resolve(configFile)
+    : path.resolve(
+        process.env.CODEX2WEB_RUNTIME_DIR || ".codex2web/runtime",
+        `cloudflared-${safeFileSegment(tunnelName || tunnelId)}.yml`,
+      );
   const configContent = [
     `tunnel: ${tunnelId}`,
     `credentials-file: ${credentialsFile}`,
@@ -101,8 +117,9 @@ async function createNamedTunnelConfig({ credentialsFile, hostname, port, tunnel
     "  - service: http_status:404",
     "",
   ].join("\n");
+  await mkdir(path.dirname(configPath), { recursive: true });
   await writeFile(configPath, configContent, "utf-8");
-  return { configPath, tempDir };
+  return { configPath };
 }
 
 async function buildTunnelCommand(provider, port, namedTunnelOptions) {
@@ -112,7 +129,7 @@ async function buildTunnelCommand(provider, port, namedTunnelOptions) {
       process.env.CLOUDFLARED_BIN || (existsSync(localBinaryPath) ? localBinaryPath : "cloudflared");
 
     if (namedTunnelOptions?.useNamedTunnel) {
-      const { credentialsFile, hostname, tunnelId, tunnelName } = namedTunnelOptions;
+      const { configFile, credentialsFile, hostname, tunnelId, tunnelName } = namedTunnelOptions;
       if (!tunnelId || !hostname || !credentialsFile) {
         throw new Error(
           "Named tunnel mode requires --tunnel-id, --hostname, and --credentials-file (or the matching CODEX2WEB_CLOUDFLARE_* env vars).",
@@ -123,14 +140,16 @@ async function buildTunnelCommand(provider, port, namedTunnelOptions) {
       }
 
       const tempConfig = await createNamedTunnelConfig({
+        configFile,
         credentialsFile,
         hostname,
         port,
         tunnelId,
+        tunnelName,
       });
       return {
         args: ["tunnel", "--config", tempConfig.configPath, "run", tunnelName || tunnelId],
-        cleanupPaths: [tempConfig.tempDir],
+        cleanupPaths: [],
         cmd: cloudflaredBinary,
         displayName: "cloudflared",
         publicUrl: `https://${hostname}`,
