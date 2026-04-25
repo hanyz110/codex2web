@@ -151,6 +151,16 @@ npm run spec:gate
 8. [Security Notes](docs/security.md)
 9. [Troubleshooting](docs/troubleshooting.md)
 10. [Spec Kit Workflow](spec-kit/README.md)
+11. [Contributing](CONTRIBUTING.md)
+12. [Security Policy](SECURITY.md)
+13. [Changelog](CHANGELOG.md)
+
+## Repository Standards
+
+1. license: [MIT](LICENSE)
+2. contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
+3. security policy: [SECURITY.md](SECURITY.md)
+4. example environment variables: [.env.example](.env.example)
 
 ## Known Constraints
 
