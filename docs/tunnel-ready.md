@@ -97,7 +97,7 @@ Equivalent env vars:
 
 Behavior:
 
-1. launcher generates a temporary cloudflared config with ingress pointing to local `127.0.0.1:<port>`
+1. launcher generates a stable cloudflared config under `~/Library/Application Support/codex2web/runtime/` with ingress pointing to local `127.0.0.1:<port>`
 2. cloudflared runs the named tunnel instead of requesting a quick tunnel
 3. public URL becomes the fixed hostname you provided
 4. the same Basic Auth and execution profile checks still apply
@@ -191,3 +191,32 @@ AUTH=$(printf 'codex2web:<password>' | base64)
 curl -i --resolve "${DOMAIN}:443:${IP}" "https://${DOMAIN}/api/system/meta" \
   -H "Authorization: Basic ${AUTH}"
 ```
+
+## macOS Auto-Restart
+
+For a stable personal external entry, install the launchd watchdog so the external server and Cloudflare connector restart after crashes, terminal exits, or login restarts:
+
+```bash
+npm run external:install-launchd -- \
+  --port 4422 \
+  --user codex2web \
+  --pass 'change-me-now' \
+  --hostname codex2web.idea-search.com \
+  --tunnel-id da1e0fbb-39ec-49f2-a66c-ce3caed9778f \
+  --tunnel-name codex2web \
+  --credentials-file ~/.cloudflared/da1e0fbb-39ec-49f2-a66c-ce3caed9778f.json
+```
+
+Operational checks:
+
+```bash
+npm run external:launchd-status
+npm run external:health -- --pass 'change-me-now' --attempts 3
+```
+
+Behavior:
+
+1. launchd keeps `npm run external:trusted` alive with `KeepAlive=true`
+2. credentials are stored in `~/Library/Application Support/codex2web/external/launchd.env` with `0600` permissions
+3. logs are written to `~/Library/Logs/codex2web/external-launchd.*.log`
+4. uninstall with `npm run external:uninstall-launchd`
