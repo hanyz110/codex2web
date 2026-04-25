@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "activePhase": "P12",
+  "phases": [
+    {
+      "id": "P1",
+      "title": "Local Bridge and Browser Session Surface",
+      "status": "closed",
+      "specPath": "spec-kit/phases/p1-local-bridge-and-browser-session-surface.md",
+      "updatedAt": "2026-04-24T18:21:44.675Z",
+      "gates": {
+        "plan": true,
+        "review": true,
+        "execute": true,
+        "qa": true,
+        "acceptance": true
+      }
+    },
+    {
+      "id": "P2",
+      "title": "Session Restore and Explicit Selection Hardening",
+      "status": "closed",
+      "specPath": "spec-kit/phases/p2-session-restore-and-explicit-selection-hardening.md",
+      "updatedAt": "2026-04-24T18:26:49.420Z",
+      "gates": {
+        "plan": true,
+        "review": true,
+        "execute": true,
+        "qa": true,
+        "acceptance": true
+      }
+    },
+    {
+      "id": "P3",
+      "title": "External Access and Auth Boundary",
+      "status": "closed",
+      "specPath": "spec-kit/phases/p3-external-access-and-auth-boundary.md",
+      "updatedAt": "2026-04-24T18:31:06.592Z",
+      "gates": {
+        "plan": true,
+        "review": true,
+        "execute": true,
+        "qa": true,
+        "acceptance": true
+      }
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P4",
+      "specPath": "spec-kit/phases/p4-real-codex-session-bridge-and-chat-first-ui.md",
+      "status": "closed",
+      "title": "Real Codex Session Bridge and Chat-First UI",
+      "updatedAt": "2026-04-25T00:45:50.388Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P5",
+      "specPath": "spec-kit/phases/p5-chat-surface-ux-simplification-and-mobile-first-session-experience.md",
+      "status": "closed",
+      "title": "Chat Surface UX Simplification and Mobile-First Session Experience",
+      "updatedAt": "2026-04-25T01:17:45.997Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P6",
+      "specPath": "spec-kit/phases/p6-mobile-transcript-priority-and-density-reduction.md",
+      "status": "closed",
+      "title": "Mobile Transcript Priority and Density Reduction",
+      "updatedAt": "2026-04-25T01:25:20.308Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P7",
+      "specPath": "spec-kit/phases/p7-transcript-content-rendering-and-latest-message-navigation.md",
+      "status": "closed",
+      "title": "Transcript Content Rendering and Latest-Message Navigation",
+      "updatedAt": "2026-04-25T01:35:14.068Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P8",
+      "specPath": "spec-kit/phases/p8-reference-driven-mobile-chat-mode-redesign.md",
+      "status": "closed",
+      "title": "Reference-Driven Mobile Chat Mode Redesign",
+      "updatedAt": "2026-04-25T01:56:24.460Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P9",
+      "specPath": "spec-kit/phases/p9-transcript-link-and-code-action-enhancements.md",
+      "status": "closed",
+      "title": "Transcript Link and Code Action Enhancements",
+      "updatedAt": "2026-04-25T02:58:58.628Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P12",
+      "specPath": "spec-kit/phases/p12-in-flight-turn-stop-and-execution-cancellation.md",
+      "status": "ready_to_close",
+      "title": "In-Flight Turn Stop and Execution Cancellation",
+      "updatedAt": "2026-04-25T04:58:03.318Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P11",
+      "specPath": "spec-kit/phases/p11-external-tunnel-launch-and-remote-phone-access-verification.md",
+      "status": "closed",
+      "title": "External Tunnel Launch and Remote Phone Access Verification",
+      "updatedAt": "2026-04-25T04:13:46.480Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P10",
+      "specPath": "spec-kit/phases/p10-multi-project-session-discovery-and-explicit-switching.md",
+      "status": "closed",
+      "title": "Multi-Project Session Discovery and Explicit Switching",
+      "updatedAt": "2026-04-25T03:10:30.214Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P13",
+      "specPath": "spec-kit/phases/p13-transcript-width-containment-and-scrollbar-cleanup.md",
+      "status": "closed",
+      "title": "Transcript Width Containment and Scrollbar Cleanup",
+      "updatedAt": "2026-04-25T03:40:12.986Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P14",
+      "specPath": "spec-kit/phases/p14-browser-execution-permission-parity-and-trust-boundary.md",
+      "status": "closed",
+      "title": "Browser Execution Permission Parity and Trust Boundary",
+      "updatedAt": "2026-04-25T03:57:07.169Z"
+    }
+  ]
+}

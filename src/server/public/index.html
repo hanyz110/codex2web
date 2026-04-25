@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex2Web Real Session Chat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主内容</a>
+
+    <div id="bootLoading" class="boot-loading" role="status" aria-live="polite" aria-label="页面加载中">
+      <div class="boot-loading-card">
+        <span class="loading-spinner" aria-hidden="true"></span>
+        <p id="bootLoadingTitle" class="boot-loading-title">正在恢复会话</p>
+        <p id="bootLoadingCopy" class="boot-loading-copy">读取本地会话、历史消息与执行边界...</p>
+        <div class="boot-loading-skeleton" aria-hidden="true">
+          <span class="boot-loading-line boot-loading-line-short"></span>
+          <span class="boot-loading-line"></span>
+          <span class="boot-loading-line"></span>
+        </div>
+      </div>
+    </div>
+
+    <div id="operationLoading" class="operation-loading" role="status" aria-live="polite" hidden>
+      <span class="loading-spinner loading-spinner-sm" aria-hidden="true"></span>
+      <span id="operationLoadingText">处理中...</span>
+    </div>
+
+    <div class="page-shell">
+      <header class="session-bar surface" aria-label="当前会话摘要">
+        <div class="session-title-row">
+          <button
+            id="openDrawerButton"
+            class="btn-secondary appbar-button"
+            type="button"
+            aria-expanded="false"
+            aria-controls="sessionDrawer"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M4 7h16M4 12h16M4 17h16"
+                fill="none"
+                stroke="currentColor"
+                stroke-linecap="round"
+                stroke-width="2"
+              />
+            </svg>
+            <span class="button-label">详情</span>
+          </button>
+
+          <div class="session-copy">
+            <h1 id="sessionName">等待绑定真实会话</h1>
+            <p class="session-summary">
+              <span id="sessionProjectLabel">project</span>
+              <span class="summary-sep">·</span>
+              <span id="connectionSummary">连接中</span>
+            </p>
+            <p class="session-execution-summary">
+              <span id="executionStatusPill" class="execution-status-pill" data-state="idle">空闲</span>
+              <span id="executionSummaryInline">等待执行状态</span>
+            </p>
+          </div>
+
+          <span id="mobileStatusPill" class="mobile-status-pill" hidden>连接中</span>
+        </div>
+
+        <div class="status-cluster" aria-label="会话状态">
+          <span id="connectionBadge" class="badge">-</span>
+          <span id="attachBadge" class="badge">-</span>
+          <span id="streamBadge" class="badge">-</span>
+          <span id="sendBadge" class="badge">-</span>
+        </div>
+      </header>
+
+      <main id="main-content" class="main-shell">
+        <div class="chat-main">
+          <section class="transcript-shell surface" aria-labelledby="transcriptTitle">
+            <h2 id="transcriptTitle" class="sr-only">实时对话</h2>
+
+            <ul id="transcriptList" class="transcript-list" aria-live="polite"></ul>
+            <button id="jumpToLatestButton" class="jump-to-latest" type="button" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M12 5v14M6 13l6 6 6-6"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                />
+              </svg>
+              <span>回到最新消息</span>
+            </button>
+            <div id="transcriptEmpty" class="empty-state">
+              <p class="empty-title">当前会话还没有可显示的对话</p>
+              <p class="empty-copy">发送第一条指令后，这里会持续显示同一条本地 Codex 会话的真实聊天流。</p>
+            </div>
+          </section>
+
+          <section id="globalAlert" class="inline-alert surface" role="alert" aria-live="assertive" hidden></section>
+
+          <section class="composer-shell surface" aria-labelledby="composerTitle">
+            <h2 id="composerTitle" class="sr-only">继续当前会话</h2>
+            <p id="composerContext" class="sr-only">已锁定到当前 pinned session，不会静默切换。</p>
+
+            <form id="composerForm" class="composer-form" novalidate>
+              <label class="sr-only" for="composerInput">下一条指令</label>
+              <div class="composer-row">
+                <button
+                  class="icon-button composer-more"
+                  type="button"
+                  aria-label="打开更多会话与调试操作"
+                  data-drawer-open
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d="M12 5v14M5 12h14"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-width="2"
+                    />
+                  </svg>
+                </button>
+                <textarea
+                  id="composerInput"
+                  class="input"
+                  name="message"
+                  rows="1"
+                  minlength="2"
+                  required
+                ></textarea>
+                <div class="composer-submit-wrap">
+                  <button id="sendButton" class="btn-primary composer-send" type="button" aria-label="发送">
+                    <svg class="action-icon-send" viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        d="M5 12h12M13 6l6 6-6 6"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="2"
+                      />
+                    </svg>
+                    <svg class="action-icon-stop" viewBox="0 0 24 24" aria-hidden="true" hidden>
+                      <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
+                    </svg>
+                    <span id="sendButtonLabel" class="button-label">发送</span>
+                  </button>
+                </div>
+              </div>
+              <div class="composer-actions">
+                <div class="send-feedback-stack" role="status" aria-live="polite">
+                  <p id="sendFeedback" class="send-feedback">就绪</p>
+                  <p id="sendFeedbackMeta" class="send-feedback-meta" hidden></p>
+                </div>
+              </div>
+            </form>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+    <aside id="sessionDrawer" class="session-drawer" aria-hidden="true" aria-labelledby="drawerTitle">
+      <div class="drawer-head">
+        <div>
+          <p class="eyebrow">Session Details</p>
+          <h2 id="drawerTitle">会话详情与次级控制</h2>
+        </div>
+        <button id="closeDrawerButton" class="icon-button" type="button" aria-label="关闭会话详情">
+          <span aria-hidden="true">×</span>
+        </button>
+      </div>
+
+      <section class="drawer-block">
+        <h3>当前会话</h3>
+        <dl class="detail-list">
+          <div>
+            <dt>会话名</dt>
+            <dd id="drawerSessionName">-</dd>
+          </div>
+          <div>
+            <dt>会话 ID</dt>
+            <dd id="sessionIdentity">-</dd>
+          </div>
+          <div>
+            <dt>项目路径</dt>
+            <dd id="sessionProjectPath">-</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="drawer-block" aria-labelledby="switchTitle">
+        <div class="section-head">
+          <h3 id="switchTitle">显式切换</h3>
+          <button id="explicitSwitch" class="btn-secondary" type="button">刷新列表</button>
+        </div>
+        <p class="panel-note">只允许用户手动选择，不允许 latest-active 或 project-name 静默重绑。</p>
+        <ul id="sessionCandidates" class="session-candidates"></ul>
+      </section>
+
+      <section class="drawer-block" aria-labelledby="auditTitle">
+        <h3 id="auditTitle">Switch Audit</h3>
+        <ul id="auditList" class="audit-list"></ul>
+      </section>
+
+      <section class="drawer-block" aria-labelledby="securityTitle">
+        <h3 id="securityTitle">Auth Boundary</h3>
+        <p id="securityMode" class="panel-note">mode: unknown</p>
+        <p id="securityAuth" class="panel-note">auth: unknown</p>
+        <p id="executionMode" class="panel-note">execution: unknown</p>
+        <p id="executionSummary" class="panel-note">policy: unknown</p>
+      </section>
+
+      <section class="drawer-block qa-block" aria-labelledby="qaTitle">
+        <div class="section-head">
+          <h3 id="qaTitle">QA Mode</h3>
+          <span class="qa-chip">仅测试</span>
+        </div>
+        <div class="qa-actions">
+          <button id="simulateReconnect" class="btn-secondary" type="button">恢复连接</button>
+          <button id="simulateDisconnect" class="btn-secondary" type="button">断流演示</button>
+        </div>
+        <ul class="failures">
+          <li>
+            <button class="btn-danger" type="button" data-failure="connection">触发连接失败</button>
+            <p>验证断流后发送被阻止，并且恢复提示清晰可见。</p>
+          </li>
+          <li>
+            <button class="btn-danger" type="button" data-failure="session">触发附着失败</button>
+            <p>验证重新显式选择会话时不会发生静默回退。</p>
+          </li>
+          <li>
+            <button class="btn-danger" type="button" data-failure="send">触发发送失败</button>
+            <p>验证发送失败时错误只贴近主聊天路径出现。</p>
+          </li>
+        </ul>
+      </section>
+
+      <div class="drawer-mobile-dismiss" role="presentation">
+        <button
+          id="closeDrawerButtonMobile"
+          class="btn-secondary drawer-close-mobile"
+          type="button"
+          aria-label="收起会话详情"
+        >
+          收起面板
+        </button>
+      </div>
+    </aside>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

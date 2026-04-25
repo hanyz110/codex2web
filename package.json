@@ -1,0 +1,15 @@
+{
+  "name": "codex2web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "node src/server/dev-server.js",
+    "start": "node src/server/dev-server.js",
+    "external:launch": "node scripts/external-access.mjs launch",
+    "external:trusted": "node scripts/external-access.mjs launch --remote-trusted",
+    "spec:status": "node scripts/spec-kit.mjs status",
+    "spec:autoplan": "node scripts/spec-kit.mjs autoplan",
+    "spec:gate": "node scripts/spec-kit.mjs gate"
+  }
+}
