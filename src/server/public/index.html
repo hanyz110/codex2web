@@ -40,18 +40,11 @@
             id="openDrawerButton"
             class="btn-secondary appbar-button"
             type="button"
+            aria-label="打开会话详情"
             aria-expanded="false"
             aria-controls="sessionDrawer"
           >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M4 7h16M4 12h16M4 17h16"
-                fill="none"
-                stroke="currentColor"
-                stroke-linecap="round"
-                stroke-width="2"
-              />
-            </svg>
+            <span class="appbar-dots" aria-hidden="true"><span></span><span></span><span></span></span>
             <span class="button-label">详情</span>
           </button>
 
@@ -113,22 +106,38 @@
             <form id="composerForm" class="composer-form" novalidate>
               <label class="sr-only" for="composerInput">下一条指令</label>
               <div class="composer-row">
-                <button
-                  class="icon-button composer-more"
-                  type="button"
-                  aria-label="打开更多会话与调试操作"
-                  data-drawer-open
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path
-                      d="M12 5v14M5 12h14"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-linecap="round"
-                      stroke-width="2"
-                    />
-                  </svg>
-                </button>
+                <div class="quick-command-wrap">
+                  <button
+                    id="quickCommandButton"
+                    class="icon-button composer-more"
+                    type="button"
+                    aria-label="选择常用指令"
+                    aria-expanded="false"
+                    aria-haspopup="menu"
+                    aria-controls="quickCommandMenu"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        d="M12 5v14M5 12h14"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-width="2"
+                      />
+                    </svg>
+                  </button>
+                  <div id="quickCommandMenu" class="quick-command-menu" role="menu" hidden>
+                    <button class="quick-command-item" type="button" role="menuitem" data-quick-command="按照SOP继续推进">
+                      按照SOP继续推进
+                    </button>
+                    <button class="quick-command-item" type="button" role="menuitem" data-quick-command="继续">
+                      继续
+                    </button>
+                    <button class="quick-command-item" type="button" role="menuitem" data-quick-command="同意">
+                      同意
+                    </button>
+                  </div>
+                </div>
                 <textarea
                   id="composerInput"
                   class="input"

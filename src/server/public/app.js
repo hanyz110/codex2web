@@ -83,6 +83,9 @@ const bootLoadingTitle = document.querySelector("#bootLoadingTitle");
 const bootLoadingCopy = document.querySelector("#bootLoadingCopy");
 const operationLoading = document.querySelector("#operationLoading");
 const operationLoadingText = document.querySelector("#operationLoadingText");
+const quickCommandButton = document.querySelector("#quickCommandButton");
+const quickCommandMenu = document.querySelector("#quickCommandMenu");
+const quickCommandItems = document.querySelectorAll("[data-quick-command]");
 
 const badgeElements = {
   attach: document.querySelector("#attachBadge"),
@@ -499,6 +502,26 @@ function setDrawer(open) {
   setHidden(drawerBackdrop, !open);
 }
 
+function setQuickCommandMenu(open) {
+  setHidden(quickCommandMenu, !open);
+  setAttr(quickCommandButton, "aria-expanded", String(open));
+}
+
+function insertQuickCommand(command) {
+  if (!composerInput || !command) {
+    return;
+  }
+
+  composerInput.value = command;
+  composerInput.dispatchEvent(new Event("input", { bubbles: true }));
+  setQuickCommandMenu(false);
+  try {
+    composerInput.focus({ preventScroll: true });
+  } catch {
+    composerInput.focus();
+  }
+}
+
 function setBadge(kind, value) {
   const target = badgeElements[kind];
   if (!target) {
@@ -644,6 +667,56 @@ function syncComposerOffset() {
   document.documentElement.style.setProperty("--composer-offset", `${Math.max(fallback, height)}px`);
 }
 
+function statusToneFromConnection(value) {
+  if (value === "connected") {
+    return "connected";
+  }
+  if (value === "connecting") {
+    return "connecting";
+  }
+  return "error";
+}
+
+function renderFlowStatusCard() {
+  if (!transcriptList) {
+    return;
+  }
+
+  const feedback = deriveExecutionFeedback();
+  const execution = deriveHeaderExecutionState(feedback);
+  const connection = labels.connection[state.connection] || labels.connection.error;
+  const attach = labels.attach[state.attach] || labels.attach.error;
+  const existingCard = transcriptList.querySelector("#flowStatusCard");
+  const card = existingCard || document.createElement("li");
+
+  card.id = "flowStatusCard";
+  card.className = "flow-status-card";
+  card.setAttribute("aria-live", "polite");
+  card.dataset.connection = statusToneFromConnection(state.connection);
+  card.dataset.execution = execution.state;
+
+  const detail = String(feedback.detail || "").trim();
+  const description = detail || execution.summary || connection.summary;
+  card.innerHTML = `
+    <div class="flow-status-pills" aria-label="连接和执行状态">
+      <span class="flow-status-pill" data-state="${statusToneFromConnection(state.connection)}">
+        <span class="flow-status-dot" aria-hidden="true"></span>
+        连接 · ${connection.summary}
+      </span>
+      <span class="flow-status-pill" data-state="${execution.state}">
+        <span class="flow-status-dot" aria-hidden="true"></span>
+        执行 · ${execution.label}
+      </span>
+    </div>
+    <p class="flow-status-copy">${escapeHtml(description)}</p>
+    <p class="flow-status-meta">${escapeHtml(attach.summary)} · ${escapeHtml(execution.summary)}</p>
+  `;
+
+  if (!existingCard) {
+    transcriptList.append(card);
+  }
+}
+
 function renderTranscript() {
   const distanceFromBottom =
     transcriptList.scrollHeight - transcriptList.scrollTop - transcriptList.clientHeight;
@@ -680,6 +753,8 @@ function renderTranscript() {
     item.append(row);
     transcriptList.append(item);
   }
+
+  renderFlowStatusCard();
 
   transcriptEmpty.classList.toggle("hidden", state.transcript.length > 0);
 
@@ -933,6 +1008,7 @@ function renderState() {
   if (executionSummaryInline) {
     setText(executionSummaryInline, headerExecution.summary);
   }
+  renderFlowStatusCard();
 }
 
 function updateBinding(binding) {
@@ -1397,7 +1473,38 @@ document.addEventListener("visibilitychange", () => {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     setDrawer(false);
+    setQuickCommandMenu(false);
   }
+});
+
+quickCommandButton?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setQuickCommandMenu(Boolean(quickCommandMenu?.hidden));
+});
+
+quickCommandMenu?.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  const commandButton = target.closest("[data-quick-command]");
+  if (!(commandButton instanceof HTMLElement)) {
+    return;
+  }
+
+  insertQuickCommand(commandButton.dataset.quickCommand || "");
+});
+
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Node)) {
+    return;
+  }
+  if (quickCommandButton?.contains(target) || quickCommandMenu?.contains(target)) {
+    return;
+  }
+  setQuickCommandMenu(false);
 });
 
 simulateDisconnect?.addEventListener("click", async () => {
