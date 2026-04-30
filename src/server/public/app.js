@@ -20,9 +20,9 @@ const labels = {
     error: { className: "is-error", summary: "附着失败", text: "attach-error" },
   },
   connection: {
-    connected: { className: "is-ok", summary: "已连接", text: "connected" },
-    connecting: { className: "is-warn", summary: "连接中", text: "connecting" },
-    error: { className: "is-error", summary: "连接异常", text: "connection-error" },
+    connected: { className: "is-ok", summary: "已连接", text: "已连接" },
+    connecting: { className: "is-warn", summary: "连接中", text: "连接中" },
+    error: { className: "is-error", summary: "连接异常", text: "连接异常" },
   },
   send: {
     idle: { className: "is-idle", summary: "可发送", text: "send-idle" },
@@ -52,14 +52,14 @@ const sendFeedbackMeta = document.querySelector("#sendFeedbackMeta");
 const composerContext = document.querySelector("#composerContext");
 const globalAlert = document.querySelector("#globalAlert");
 const sessionName = document.querySelector("#sessionName");
-const sessionIdentity = document.querySelector("#sessionIdentity");
-const sessionProjectPath = document.querySelector("#sessionProjectPath");
 const sessionProjectLabel = document.querySelector("#sessionProjectLabel");
 const connectionSummary = document.querySelector("#connectionSummary");
 const executionStatusPill = document.querySelector("#executionStatusPill");
 const executionSummaryInline = document.querySelector("#executionSummaryInline");
 const mobileStatusPill = document.querySelector("#mobileStatusPill");
-const drawerSessionName = document.querySelector("#drawerSessionName");
+const favoriteCurrentSession = document.querySelector("#favoriteCurrentSession");
+const favoriteSessionCount = document.querySelector("#favoriteSessionCount");
+const favoriteSessionsList = document.querySelector("#favoriteSessions");
 const sessionCandidates = document.querySelector("#sessionCandidates");
 const auditList = document.querySelector("#auditList");
 const securityMode = document.querySelector("#securityMode");
@@ -106,9 +106,11 @@ let snapshotPollTimer = null;
 let transportWatchdogTimer = null;
 let sessionsLoaded = false;
 let sessionsLoadingPromise = null;
+let favoriteSessions = new Map();
 const COMPOSER_MIN_HEIGHT = 38;
 const DRAWER_CLOSE_TRANSITION_MS = 240;
 const MIN_OPERATION_LOADING_MS = 300;
+const FAVORITE_STORAGE_KEY = "codex2web.sessionFavorites.v1";
 const REQUEST_TIMEOUT_MS = 12000;
 const BOOT_LOADING_MAX_MS = 15000;
 const ALERT_AUTO_HIDE_BASE_MS = 3200;
@@ -121,9 +123,15 @@ const EXTERNAL_STALE_SNAPSHOT_MS = 6000;
 const EXTERNAL_STALE_RECONNECT_MS = 12000;
 const EXECUTION_NO_OUTPUT_HINT_MS = 8000;
 const EXECUTION_STALLED_HINT_MS = 20000;
+const DRAWER_EDGE_SWIPE_MAX_WIDTH = 768;
+const DRAWER_EDGE_SWIPE_RIGHT_INSET_PX = 40;
+const DRAWER_EDGE_SWIPE_ZONE_PX = 64;
+const DRAWER_EDGE_SWIPE_MIN_DELTA_X = 64;
+const DRAWER_EDGE_SWIPE_MAX_DELTA_Y = 44;
 let operationLoadingCount = 0;
 let bootStage = "恢复会话";
 let alertAutoHideTimerId = 0;
+let drawerEdgeSwipe = null;
 
 function setText(target, value) {
   if (target) {
@@ -196,6 +204,148 @@ function formatTime(isoString) {
 
 function basename(input) {
   return input.split(/[\\/]/).filter(Boolean).pop() || input;
+}
+
+function formatHeaderSessionTitle() {
+  const projectLabel = basename(state.sessionProjectPath || "project");
+  const sessionLabel = state.sessionName || "未绑定真实会话";
+  return `${projectLabel} / ${sessionLabel}`;
+}
+
+function normalizeFavoriteSession(session) {
+  if (!session?.id) {
+    return null;
+  }
+
+  return {
+    id: String(session.id),
+    name: String(session.name || session.id),
+    projectPath: String(session.projectPath || "unknown"),
+    updatedAt: session.updatedAt || "",
+  };
+}
+
+function getCurrentSessionSnapshot() {
+  if (!state.pinnedSessionId) {
+    return null;
+  }
+
+  return normalizeFavoriteSession({
+    id: state.pinnedSessionId,
+    name: state.sessionName,
+    projectPath: state.sessionProjectPath,
+    updatedAt: favoriteSessions.get(state.pinnedSessionId)?.updatedAt || "",
+  });
+}
+
+function saveFavoriteSessions() {
+  try {
+    window.localStorage.setItem(
+      FAVORITE_STORAGE_KEY,
+      JSON.stringify(Array.from(favoriteSessions.values())),
+    );
+  } catch {
+    // Ignore persistence failures in constrained browser modes.
+  }
+}
+
+function loadFavoriteSessions() {
+  try {
+    const raw = window.localStorage.getItem(FAVORITE_STORAGE_KEY);
+    favoriteSessions = new Map();
+    if (!raw) {
+      return;
+    }
+
+    const entries = JSON.parse(raw);
+    if (!Array.isArray(entries)) {
+      return;
+    }
+
+    for (const entry of entries) {
+      const normalized = normalizeFavoriteSession(entry);
+      if (normalized) {
+        favoriteSessions.set(normalized.id, normalized);
+      }
+    }
+  } catch {
+    favoriteSessions = new Map();
+  }
+}
+
+function isSessionFavorited(sessionId) {
+  return Boolean(sessionId) && favoriteSessions.has(sessionId);
+}
+
+function syncFavoriteSessionSnapshot(session) {
+  const normalized = normalizeFavoriteSession(session);
+  if (!normalized || !favoriteSessions.has(normalized.id)) {
+    return;
+  }
+
+  favoriteSessions.set(normalized.id, normalized);
+}
+
+function syncFavoriteSessionsFromState() {
+  const current = getCurrentSessionSnapshot();
+  if (current) {
+    syncFavoriteSessionSnapshot(current);
+  }
+
+  for (const session of state.sessions) {
+    syncFavoriteSessionSnapshot(session);
+  }
+
+  saveFavoriteSessions();
+}
+
+function resolveFavoriteSessions() {
+  const liveSessions = new Map(state.sessions.map((session) => [session.id, session]));
+  const current = getCurrentSessionSnapshot();
+  if (current) {
+    liveSessions.set(current.id, { ...current, isCurrent: true });
+  }
+
+  return Array.from(favoriteSessions.values())
+    .map((stored) => {
+      const live = liveSessions.get(stored.id);
+      const merged = normalizeFavoriteSession(live ? { ...stored, ...live } : stored);
+      if (!merged) {
+        return null;
+      }
+
+      return {
+        ...merged,
+        isCurrent: merged.id === state.pinnedSessionId,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => {
+      if (left.isCurrent !== right.isCurrent) {
+        return left.isCurrent ? -1 : 1;
+      }
+
+      return parseIsoTime(right.updatedAt) - parseIsoTime(left.updatedAt);
+    });
+}
+
+function toggleFavoriteSession(session) {
+  const normalized = normalizeFavoriteSession(session);
+  if (!normalized) {
+    return false;
+  }
+
+  const nextFavorite = !favoriteSessions.has(normalized.id);
+  if (nextFavorite) {
+    favoriteSessions.set(normalized.id, normalized);
+  } else {
+    favoriteSessions.delete(normalized.id);
+  }
+
+  saveFavoriteSessions();
+  renderFavoriteSessions();
+  renderSessionCandidates();
+  return nextFavorite;
 }
 
 function parseIsoTime(value) {
@@ -502,6 +652,106 @@ function setDrawer(open) {
   setHidden(drawerBackdrop, !open);
 }
 
+function openDrawerWithSessionCatalog() {
+  setDrawer(true);
+  void ensureSessionCatalogLoaded({ silent: true });
+}
+
+function getViewportWidth() {
+  return window.visualViewport?.width || window.innerWidth || document.documentElement.clientWidth || 0;
+}
+
+function isMobileDrawerGestureEnabled() {
+  return getViewportWidth() <= DRAWER_EDGE_SWIPE_MAX_WIDTH;
+}
+
+function shouldIgnoreDrawerEdgeSwipeTarget(target) {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+
+  return Boolean(
+    target.closest(
+      [
+        ".session-drawer",
+        ".drawer-backdrop",
+        ".composer-shell",
+        "button",
+        "textarea",
+        "input",
+        "select",
+        "a",
+        "[role='button']",
+      ].join(", "),
+    ),
+  );
+}
+
+function handleDrawerEdgeSwipeStart(event) {
+  if (!isMobileDrawerGestureEnabled() || sessionDrawer?.classList.contains("is-open")) {
+    drawerEdgeSwipe = null;
+    return;
+  }
+  if (event.touches.length !== 1) {
+    drawerEdgeSwipe = null;
+    return;
+  }
+  if (shouldIgnoreDrawerEdgeSwipeTarget(event.target)) {
+    drawerEdgeSwipe = null;
+    return;
+  }
+
+  const touch = event.touches[0];
+  const viewportWidth = getViewportWidth();
+  const gestureMaxX = viewportWidth - DRAWER_EDGE_SWIPE_RIGHT_INSET_PX;
+  const gestureMinX = gestureMaxX - DRAWER_EDGE_SWIPE_ZONE_PX;
+  if (touch.clientX < gestureMinX || touch.clientX > gestureMaxX) {
+    drawerEdgeSwipe = null;
+    return;
+  }
+
+  drawerEdgeSwipe = {
+    lastX: touch.clientX,
+    lastY: touch.clientY,
+    startX: touch.clientX,
+    startY: touch.clientY,
+  };
+}
+
+function handleDrawerEdgeSwipeMove(event) {
+  if (!drawerEdgeSwipe || event.touches.length !== 1) {
+    return;
+  }
+
+  const touch = event.touches[0];
+  drawerEdgeSwipe.lastX = touch.clientX;
+  drawerEdgeSwipe.lastY = touch.clientY;
+}
+
+function handleDrawerEdgeSwipeEnd() {
+  if (!drawerEdgeSwipe) {
+    return;
+  }
+
+  const deltaX = drawerEdgeSwipe.lastX - drawerEdgeSwipe.startX;
+  const deltaY = drawerEdgeSwipe.lastY - drawerEdgeSwipe.startY;
+  const isHorizontalSwipe = Math.abs(deltaX) > Math.abs(deltaY) * 1.35;
+  const isOpenGesture =
+    deltaX <= -DRAWER_EDGE_SWIPE_MIN_DELTA_X &&
+    Math.abs(deltaY) <= DRAWER_EDGE_SWIPE_MAX_DELTA_Y &&
+    isHorizontalSwipe;
+
+  drawerEdgeSwipe = null;
+
+  if (isOpenGesture) {
+    openDrawerWithSessionCatalog();
+  }
+}
+
+function handleDrawerEdgeSwipeCancel() {
+  drawerEdgeSwipe = null;
+}
+
 function setQuickCommandMenu(open) {
   setHidden(quickCommandMenu, !open);
   setAttr(quickCommandButton, "aria-expanded", String(open));
@@ -696,20 +946,9 @@ function renderFlowStatusCard() {
   card.dataset.execution = execution.state;
 
   const detail = String(feedback.detail || "").trim();
-  const description = detail || execution.summary || connection.summary;
+  const description = detail || execution.summary || "等待执行状态";
   card.innerHTML = `
-    <div class="flow-status-pills" aria-label="连接和执行状态">
-      <span class="flow-status-pill" data-state="${statusToneFromConnection(state.connection)}">
-        <span class="flow-status-dot" aria-hidden="true"></span>
-        连接 · ${connection.summary}
-      </span>
-      <span class="flow-status-pill" data-state="${execution.state}">
-        <span class="flow-status-dot" aria-hidden="true"></span>
-        执行 · ${execution.label}
-      </span>
-    </div>
     <p class="flow-status-copy">${escapeHtml(description)}</p>
-    <p class="flow-status-meta">${escapeHtml(attach.summary)} · ${escapeHtml(execution.summary)}</p>
   `;
 
   if (!existingCard) {
@@ -770,12 +1009,131 @@ function renderTranscript() {
   updateJumpToLatestVisibility();
 }
 
+function createFavoriteButton(session, { compact = false } = {}) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = compact ? "session-favorite-button is-compact" : "session-favorite-button";
+  button.setAttribute("data-favorite-session-id", session.id);
+
+  const favorited = isSessionFavorited(session.id);
+  button.setAttribute("aria-pressed", String(favorited));
+  button.setAttribute("aria-label", favorited ? "取消收藏该会话" : "收藏该会话");
+
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("viewBox", "0 0 24 24");
+  icon.setAttribute("aria-hidden", "true");
+  icon.classList.add("session-favorite-icon");
+
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute(
+    "d",
+    "M12 3.7l2.35 4.76 5.25.76-3.8 3.7.9 5.23L12 15.68l-4.7 2.47.9-5.23-3.8-3.7 5.25-.76L12 3.7z",
+  );
+
+  icon.append(path);
+  button.append(icon);
+  return button;
+}
+
+function renderFavoriteSessions() {
+  if (!favoriteSessionsList) {
+    return;
+  }
+
+  const favorites = resolveFavoriteSessions();
+  favoriteSessionsList.innerHTML = "";
+  setText(favoriteSessionCount, String(favorites.length));
+
+  if (favoriteCurrentSession) {
+    const hasCurrent = state.pinnedSessionId && isSessionFavorited(state.pinnedSessionId);
+    favoriteCurrentSession.textContent = hasCurrent ? "已收藏" : "收藏当前";
+    favoriteCurrentSession.setAttribute("aria-pressed", String(hasCurrent));
+  }
+
+  if (favorites.length === 0) {
+    const item = document.createElement("li");
+    item.className = "favorite-empty";
+    item.textContent = "暂无收藏。可在列表右侧点击星标添加。";
+    favoriteSessionsList.append(item);
+    return;
+  }
+
+  for (const session of favorites) {
+    const item = document.createElement("li");
+    item.className = "favorite-session-item";
+    if (!session.isCurrent) {
+      item.setAttribute("data-session-id", session.id);
+      item.setAttribute("data-session-label", session.name || session.id);
+      item.setAttribute("role", "button");
+      item.setAttribute("tabindex", "0");
+    }
+
+    const header = document.createElement("div");
+    header.className = "session-item-header";
+
+    const titleWrap = document.createElement("div");
+    titleWrap.className = "session-item-title-wrap";
+
+    const title = document.createElement("p");
+    title.className = "session-item-title";
+    title.textContent = session.name || session.id;
+
+    const chips = document.createElement("div");
+    chips.className = "session-item-tags";
+
+    const projectTag = document.createElement("span");
+    projectTag.className = "session-item-tag is-project";
+    projectTag.textContent = basename(session.projectPath);
+
+    chips.append(projectTag);
+
+    if (session.isCurrent) {
+      const currentTag = document.createElement("span");
+      currentTag.className = "session-item-tag is-current";
+      currentTag.textContent = "当前会话";
+      chips.append(currentTag);
+    }
+
+    titleWrap.append(title, chips);
+
+    const actions = document.createElement("div");
+    actions.className = "session-inline-actions";
+
+    const favoriteButton = createFavoriteButton(session);
+    actions.append(favoriteButton);
+
+    if (session.isCurrent) {
+      const currentBadge = document.createElement("span");
+      currentBadge.className = "session-current-pill";
+      currentBadge.textContent = "当前";
+      actions.append(currentBadge);
+    } else {
+      const switchButton = document.createElement("button");
+      switchButton.type = "button";
+      switchButton.className = "btn-secondary";
+      switchButton.textContent = "切换";
+      switchButton.setAttribute("data-session-id", session.id);
+      actions.append(switchButton);
+    }
+
+    const meta = document.createElement("p");
+    meta.className = "session-item-meta";
+    meta.textContent = [session.projectPath, session.updatedAt ? `updated ${formatTime(session.updatedAt)}` : ""]
+      .filter(Boolean)
+      .join(" · ");
+
+    header.append(titleWrap, actions);
+    item.append(header, meta);
+    favoriteSessionsList.append(item);
+  }
+}
+
 function renderSessionCandidates() {
   sessionCandidates.innerHTML = "";
 
   if (!sessionsLoaded) {
     const item = document.createElement("li");
-    item.textContent = sessionsLoadingPromise ? "正在加载会话列表..." : "点击刷新列表后加载可切换会话。";
+    item.textContent = sessionsLoadingPromise ? "正在加载会话列表..." : "点击刷新后加载可切换会话。";
     sessionCandidates.append(item);
     return;
   }
@@ -868,11 +1226,18 @@ function renderSessionCandidates() {
 
       titleWrap.append(title, scope);
 
+      const actions = document.createElement("div");
+      actions.className = "session-inline-actions";
+
+      const favoriteButton = createFavoriteButton(session, { compact: true });
+
       const button = document.createElement("button");
       button.type = "button";
       button.className = "btn-secondary";
       button.textContent = "切换";
       button.setAttribute("data-session-id", session.id);
+
+      actions.append(favoriteButton, button);
 
       const meta = document.createElement("p");
       meta.className = "session-item-meta";
@@ -880,7 +1245,7 @@ function renderSessionCandidates() {
         .filter(Boolean)
         .join(" · ");
 
-      header.append(titleWrap, button);
+      header.append(titleWrap, actions);
       item.append(header, meta);
       sessionList.append(item);
     }
@@ -1023,11 +1388,12 @@ function updateBinding(binding) {
 
   const projectLabel = basename(state.sessionProjectPath);
 
-  setText(sessionName, state.sessionName);
-  setText(drawerSessionName, state.sessionName);
-  setText(sessionIdentity, state.pinnedSessionId || "unbound");
-  setText(sessionProjectPath, state.sessionProjectPath);
+  const headerTitle = formatHeaderSessionTitle();
+  setText(sessionName, headerTitle);
+  setAttr(sessionName, "title", headerTitle);
   setText(sessionProjectLabel, projectLabel);
+  syncFavoriteSessionsFromState();
+  renderFavoriteSessions();
 }
 
 function replaceTranscript(entries) {
@@ -1127,6 +1493,8 @@ async function loadSessions() {
   const payload = await requestJson("/api/sessions");
   state.sessions = payload.sessions || [];
   sessionsLoaded = true;
+  syncFavoriteSessionsFromState();
+  renderFavoriteSessions();
   renderSessionCandidates();
 }
 
@@ -1392,20 +1760,19 @@ async function resetFailureModes() {
   state.failureModes = payload.failureModes;
 }
 
-openDrawerButton?.addEventListener("click", () => {
-  setDrawer(true);
-  void ensureSessionCatalogLoaded({ silent: true });
-});
+openDrawerButton?.addEventListener("click", openDrawerWithSessionCatalog);
 closeDrawerButton?.addEventListener("click", () => setDrawer(false));
 closeDrawerButtonMobile?.addEventListener("click", () => setDrawer(false));
 drawerBackdrop?.addEventListener("click", () => setDrawer(false));
 drawerOpeners.forEach((button) =>
-  button.addEventListener("click", () => {
-    setDrawer(true);
-    void ensureSessionCatalogLoaded({ silent: true });
-  }),
+  button.addEventListener("click", openDrawerWithSessionCatalog),
 );
 jumpToLatestButton?.addEventListener("click", () => scrollTranscriptToBottom());
+
+document.addEventListener("touchstart", handleDrawerEdgeSwipeStart, { passive: true });
+document.addEventListener("touchmove", handleDrawerEdgeSwipeMove, { passive: true });
+document.addEventListener("touchend", handleDrawerEdgeSwipeEnd, { passive: true });
+document.addEventListener("touchcancel", handleDrawerEdgeSwipeCancel, { passive: true });
 
 transcriptList?.addEventListener("scroll", () => {
   shouldStickToBottom = isNearBottom();
@@ -1529,6 +1896,36 @@ simulateReconnect?.addEventListener("click", async () => {
   }
 });
 
+async function attachSessionById(sessionId, switchButton, sessionLabel) {
+  const stopOperationLoading = startOperationLoading(`正在切换到 ${sessionLabel}...`);
+  const originalButtonText = switchButton.textContent;
+  switchButton.classList.add("is-loading");
+  switchButton.textContent = "切换中";
+  try {
+    const attachPayload = await requestJson("/api/session/attach", {
+      body: JSON.stringify({ explicit: true, sessionId }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+
+    updateBinding(requireBinding(attachPayload.binding, "切换会话"));
+    replaceTranscript(attachPayload.transcript || []);
+    await loadSessions();
+    await loadAuditTrail();
+    renderState();
+    setAlert("");
+    jumpToChatView();
+  } catch (error) {
+    setAlert(error.message);
+  } finally {
+    if (switchButton.isConnected) {
+      switchButton.classList.remove("is-loading");
+      switchButton.textContent = originalButtonText;
+    }
+    await stopOperationLoading();
+  }
+}
+
 explicitSwitch?.addEventListener("click", async () => {
   const stopOperationLoading = startOperationLoading("正在刷新会话列表...");
   explicitSwitch.classList.add("is-loading");
@@ -1545,9 +1942,32 @@ explicitSwitch?.addEventListener("click", async () => {
   }
 });
 
+favoriteCurrentSession?.addEventListener("click", () => {
+  const current = getCurrentSessionSnapshot();
+  if (!current) {
+    return;
+  }
+
+  toggleFavoriteSession(current);
+});
+
 sessionCandidates?.addEventListener("click", async (event) => {
   const target = event.target;
-  if (!(target instanceof HTMLElement)) {
+  if (!(target instanceof Element)) {
+    return;
+  }
+
+  const favoriteButton = target.closest("button[data-favorite-session-id]");
+  if (favoriteButton instanceof HTMLButtonElement) {
+    const sessionId = favoriteButton.getAttribute("data-favorite-session-id");
+    if (!sessionId) {
+      return;
+    }
+
+    const session = state.sessions.find((item) => item.id === sessionId);
+    if (session) {
+      toggleFavoriteSession(session);
+    }
     return;
   }
 
@@ -1576,33 +1996,89 @@ sessionCandidates?.addEventListener("click", async (event) => {
   const sessionLabel =
     switchButton.closest("li")?.querySelector(".session-item-title")?.textContent?.trim() ||
     "目标会话";
-  const stopOperationLoading = startOperationLoading(`正在切换到 ${sessionLabel}...`);
-  const originalButtonText = switchButton.textContent;
-  switchButton.classList.add("is-loading");
-  switchButton.textContent = "切换中";
-  try {
-    const attachPayload = await requestJson("/api/session/attach", {
-      body: JSON.stringify({ explicit: true, sessionId }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    });
+  await attachSessionById(sessionId, switchButton, sessionLabel);
+});
 
-    updateBinding(requireBinding(attachPayload.binding, "切换会话"));
-    replaceTranscript(attachPayload.transcript || []);
-    await loadSessions();
-    await loadAuditTrail();
-    renderState();
-    setAlert("");
-    jumpToChatView();
-  } catch (error) {
-    setAlert(error.message);
-  } finally {
-    if (switchButton.isConnected) {
-      switchButton.classList.remove("is-loading");
-      switchButton.textContent = originalButtonText;
-    }
-    await stopOperationLoading();
+favoriteSessionsList?.addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
   }
+
+  const favoriteButton = target.closest("button[data-favorite-session-id]");
+  if (favoriteButton instanceof HTMLButtonElement) {
+    const sessionId = favoriteButton.getAttribute("data-favorite-session-id");
+    if (!sessionId) {
+      return;
+    }
+
+    const session =
+      state.sessions.find((item) => item.id === sessionId) ||
+      (sessionId === state.pinnedSessionId ? getCurrentSessionSnapshot() : favoriteSessions.get(sessionId));
+    if (session) {
+      toggleFavoriteSession(session);
+    }
+    return;
+  }
+
+  const switchButton = target.closest("button[data-session-id]");
+  if (switchButton instanceof HTMLButtonElement) {
+    const sessionId = switchButton.getAttribute("data-session-id");
+    if (!sessionId) {
+      return;
+    }
+
+    const sessionLabel =
+      switchButton.closest("li")?.querySelector(".session-item-title")?.textContent?.trim() ||
+      "收藏会话";
+    await attachSessionById(sessionId, switchButton, sessionLabel);
+    return;
+  }
+
+  const row = target.closest("li[data-session-id]");
+  if (!(row instanceof HTMLLIElement)) {
+    return;
+  }
+
+  const sessionId = row.getAttribute("data-session-id");
+  if (!sessionId) {
+    return;
+  }
+
+  const proxyButton = row.querySelector("button[data-session-id]");
+  if (!(proxyButton instanceof HTMLButtonElement)) {
+    return;
+  }
+
+  const sessionLabel =
+    row.getAttribute("data-session-label") ||
+    row.querySelector(".session-item-title")?.textContent?.trim() ||
+    "收藏会话";
+  await attachSessionById(sessionId, proxyButton, sessionLabel);
+});
+
+favoriteSessionsList?.addEventListener("keydown", async (event) => {
+  if (!(event.target instanceof HTMLLIElement)) {
+    return;
+  }
+  if (event.key !== "Enter" && event.key !== " ") {
+    return;
+  }
+  const row = event.target.closest("li[data-session-id]");
+  if (!(row instanceof HTMLLIElement)) {
+    return;
+  }
+  event.preventDefault();
+  const sessionId = row.getAttribute("data-session-id");
+  const proxyButton = row.querySelector("button[data-session-id]");
+  if (!sessionId || !(proxyButton instanceof HTMLButtonElement)) {
+    return;
+  }
+  const sessionLabel =
+    row.getAttribute("data-session-label") ||
+    row.querySelector(".session-item-title")?.textContent?.trim() ||
+    "收藏会话";
+  await attachSessionById(sessionId, proxyButton, sessionLabel);
 });
 
 failureButtons.forEach((button) => {
@@ -1747,6 +2223,8 @@ async function bootstrap() {
     if (!ensureRequiredDom()) {
       return;
     }
+    loadFavoriteSessions();
+    renderFavoriteSessions();
     setBootStage("恢复会话", "正在恢复会话", "读取本地会话绑定与历史消息...");
     await loadInitialState();
 

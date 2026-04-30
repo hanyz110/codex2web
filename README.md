@@ -36,8 +36,9 @@ Codex2Web is useful if you want:
 1. macOS or Linux with Node.js 20+
 2. Codex CLI installed locally
 3. existing Codex session files on the same machine
-4. optional: `cloudflared` for phone access
-5. optional: `npx` access for `localtunnel` fallback
+4. Bun runtime on `PATH` if you use gstack browser tools from browser-initiated Codex turns
+5. optional: `cloudflared` for phone access
+6. optional: `npx` access for `localtunnel` fallback
 
 ## Quick Start
 
@@ -132,8 +133,12 @@ docs/
 ```bash
 npm run dev
 npm run start
+npm run external:health -- --pass '<password>'
+npm run external:install-launchd -- --pass '<password>'
 npm run external:launch -- --port 4422
+npm run external:launchd-status
 npm run external:trusted -- --port 4422
+npm run external:uninstall-launchd
 npm run spec:status
 npm run spec:autoplan
 npm run spec:gate

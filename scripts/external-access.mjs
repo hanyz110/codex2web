@@ -13,6 +13,43 @@ const READY_TIMEOUT_MS = 20_000;
 const PUBLIC_URL_TIMEOUT_MS = 45_000;
 const PUBLIC_VERIFY_TIMEOUT_MS = 60_000;
 
+function buildRuntimePath(env = process.env) {
+  const homeDir = env.HOME || process.env.HOME || "";
+  const candidates = [
+    homeDir ? path.join(homeDir, ".bun", "bin") : "",
+    path.dirname(process.execPath),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+  const existing = String(env.PATH || "")
+    .split(":")
+    .filter(Boolean);
+  const seen = new Set();
+  return [...candidates, ...existing]
+    .filter(Boolean)
+    .filter((entry) => {
+      if (seen.has(entry)) {
+        return false;
+      }
+      seen.add(entry);
+      return true;
+    })
+    .join(":");
+}
+
+function buildRuntimeEnv(overrides = {}) {
+  const baseEnv = { ...process.env, ...overrides };
+  return {
+    ...baseEnv,
+    PATH: buildRuntimePath(baseEnv),
+  };
+}
+
 function parseArgs(argv) {
   const parsed = { _: [] };
 
@@ -346,15 +383,19 @@ async function main() {
   const allowUnverifiedPublic =
     args["allow-unverified-public"] === "true" || process.env.CODEX2WEB_ALLOW_UNVERIFIED_PUBLIC === "true";
 
+  const serviceEnv = buildRuntimeEnv({
+    CODEX2WEB_BASIC_PASS: basicPass,
+    CODEX2WEB_BASIC_USER: basicUser,
+    CODEX2WEB_EXTERNAL: "true",
+    CODEX2WEB_REMOTE_TRUSTED: remoteTrusted ? "true" : "false",
+    HOST: "0.0.0.0",
+    PORT: String(port),
+  });
+  process.env.PATH = serviceEnv.PATH;
+
   const serverChild = spawn(process.execPath, ["src/server/dev-server.js"], {
     env: {
-      ...process.env,
-      CODEX2WEB_BASIC_PASS: basicPass,
-      CODEX2WEB_BASIC_USER: basicUser,
-      CODEX2WEB_EXTERNAL: "true",
-      CODEX2WEB_REMOTE_TRUSTED: remoteTrusted ? "true" : "false",
-      HOST: "0.0.0.0",
-      PORT: String(port),
+      ...serviceEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -402,7 +443,7 @@ async function main() {
     );
   }
   tunnelChild = spawn(tunnelCommand.cmd, tunnelCommand.args, {
-    env: process.env,
+    env: serviceEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
   streamChild(tunnelCommand.displayName, tunnelChild);

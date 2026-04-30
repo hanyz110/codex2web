@@ -51,6 +51,35 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
 }
 
+function buildRuntimePath() {
+  const homeDir = os.homedir();
+  const candidates = [
+    path.join(homeDir, ".bun", "bin"),
+    path.dirname(process.execPath),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+  const existing = String(process.env.PATH || "")
+    .split(":")
+    .filter(Boolean);
+  const seen = new Set();
+  return [...candidates, ...existing]
+    .filter(Boolean)
+    .filter((entry) => {
+      if (seen.has(entry)) {
+        return false;
+      }
+      seen.add(entry);
+      return true;
+    })
+    .join(":");
+}
+
 function runLaunchctl(args, options = {}) {
   try {
     return execFileSync("launchctl", args, { encoding: "utf-8", stdio: options.stdio || "pipe" });
@@ -151,6 +180,7 @@ async function main() {
     CODEX2WEB_CLOUDFLARE_TUNNEL_NAME: tunnelName,
     CODEX2WEB_EXTERNAL_PORT: port,
     CODEX2WEB_PUBLIC_URL: `https://${hostname}`,
+    PATH: buildRuntimePath(),
   });
 
   const launchCommand = [

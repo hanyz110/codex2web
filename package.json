@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "node src/server/dev-server.js",
     "start": "node src/server/dev-server.js",
+    "external:health": "node scripts/external-health.mjs",
+    "external:install-launchd": "node scripts/install-macos-launchd.mjs install",
     "external:launch": "node scripts/external-access.mjs launch",
+    "external:launchd-status": "node scripts/install-macos-launchd.mjs status",
+    "external:uninstall-launchd": "node scripts/install-macos-launchd.mjs uninstall",
     "external:trusted": "node scripts/external-access.mjs launch --remote-trusted",
     "spec:status": "node scripts/spec-kit.mjs status",
     "spec:autoplan": "node scripts/spec-kit.mjs autoplan",

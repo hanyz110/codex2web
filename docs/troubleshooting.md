@@ -67,12 +67,39 @@ Fix:
 2. use the newly printed URL
 3. for a stable hostname, switch to a named Cloudflare tunnel
 
+For the stable `codex2web.idea-search.com` path, use the launchd-backed service instead of a manually kept terminal process:
+
+```bash
+npm run external:launchd-status
+npm run external:health -- --pass '<password>' --attempts 3
+```
+
+If launchd is not loaded or the health check fails, reinstall it:
+
+```bash
+npm run external:install-launchd -- --pass '<password>'
+```
+
 ## Public URL works but phone does not update in real time
 
 1. verify `/api/session/stream` is reachable
 2. verify snapshot polling still works
 3. verify the page is not on an old cached script
 4. restart the external process and reconnect the tunnel
+
+## Browser-triggered gstack browse says Bun is missing
+
+Root cause: the external service is often started by `launchd`, which does not inherit the same shell startup files as your terminal. If the service `PATH` lacks `~/.bun/bin`, a browser-initiated Codex turn can fail with:
+
+```text
+[browse] Executable not found in $PATH: "bun"
+```
+
+Fix:
+
+1. reinstall or restart the launchd service so it writes the normalized runtime `PATH`
+2. run `npm run external:health -- --pass '<password>' --attempts 3`
+3. confirm the health output has `localRuntimeBun=true` and `publicRuntimeBun=true`
 
 ## No sessions are found
 

@@ -35,19 +35,11 @@
 
     <div class="page-shell">
       <header class="session-bar surface" aria-label="当前会话摘要">
-        <div class="session-title-row">
-          <button
-            id="openDrawerButton"
-            class="btn-secondary appbar-button"
-            type="button"
-            aria-label="打开会话详情"
-            aria-expanded="false"
-            aria-controls="sessionDrawer"
-          >
-            <span class="appbar-dots" aria-hidden="true"><span></span><span></span><span></span></span>
-            <span class="button-label">详情</span>
-          </button>
+        <div class="connection-slot" aria-label="连接状态">
+          <span id="connectionBadge" class="badge">-</span>
+        </div>
 
+        <div class="session-title-row">
           <div class="session-copy">
             <h1 id="sessionName">等待绑定真实会话</h1>
             <p class="session-summary">
@@ -64,8 +56,19 @@
           <span id="mobileStatusPill" class="mobile-status-pill" hidden>连接中</span>
         </div>
 
+        <button
+          id="openDrawerButton"
+          class="btn-secondary appbar-button"
+          type="button"
+          aria-label="打开会话详情"
+          aria-expanded="false"
+          aria-controls="sessionDrawer"
+        >
+          <span class="appbar-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span class="button-label">详情</span>
+        </button>
+
         <div class="status-cluster" aria-label="会话状态">
-          <span id="connectionBadge" class="badge">-</span>
           <span id="attachBadge" class="badge">-</span>
           <span id="streamBadge" class="badge">-</span>
           <span id="sendBadge" class="badge">-</span>
@@ -106,38 +109,6 @@
             <form id="composerForm" class="composer-form" novalidate>
               <label class="sr-only" for="composerInput">下一条指令</label>
               <div class="composer-row">
-                <div class="quick-command-wrap">
-                  <button
-                    id="quickCommandButton"
-                    class="icon-button composer-more"
-                    type="button"
-                    aria-label="选择常用指令"
-                    aria-expanded="false"
-                    aria-haspopup="menu"
-                    aria-controls="quickCommandMenu"
-                  >
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path
-                        d="M12 5v14M5 12h14"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-linecap="round"
-                        stroke-width="2"
-                      />
-                    </svg>
-                  </button>
-                  <div id="quickCommandMenu" class="quick-command-menu" role="menu" hidden>
-                    <button class="quick-command-item" type="button" role="menuitem" data-quick-command="按照SOP继续推进">
-                      按照SOP继续推进
-                    </button>
-                    <button class="quick-command-item" type="button" role="menuitem" data-quick-command="继续">
-                      继续
-                    </button>
-                    <button class="quick-command-item" type="button" role="menuitem" data-quick-command="同意">
-                      同意
-                    </button>
-                  </div>
-                </div>
                 <textarea
                   id="composerInput"
                   class="input"
@@ -147,6 +118,44 @@
                   required
                 ></textarea>
                 <div class="composer-submit-wrap">
+                  <div class="quick-command-wrap">
+                    <button
+                      id="quickCommandButton"
+                      class="icon-button composer-more"
+                      type="button"
+                      aria-label="选择常用指令"
+                      aria-expanded="false"
+                      aria-haspopup="menu"
+                      aria-controls="quickCommandMenu"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path
+                          d="M12 5v14M5 12h14"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-linecap="round"
+                          stroke-width="2"
+                        />
+                      </svg>
+                    </button>
+                    <div id="quickCommandMenu" class="quick-command-menu" role="menu" hidden>
+                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="按照SOP继续推进">
+                        按照SOP继续推进
+                      </button>
+                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="继续">
+                        继续
+                      </button>
+                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="同意">
+                        同意
+                      </button>
+                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="修一下issue">
+                        修一下issue
+                      </button>
+                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="验收issue">
+                        验收issue
+                      </button>
+                    </div>
+                  </div>
                   <button id="sendButton" class="btn-primary composer-send" type="button" aria-label="发送">
                     <svg class="action-icon-send" viewBox="0 0 24 24" aria-hidden="true">
                       <path
@@ -181,78 +190,76 @@
     <aside id="sessionDrawer" class="session-drawer" aria-hidden="true" aria-labelledby="drawerTitle">
       <div class="drawer-head">
         <div>
-          <p class="eyebrow">Session Details</p>
-          <h2 id="drawerTitle">会话详情与次级控制</h2>
+          <p class="eyebrow">Session Center</p>
+          <h2 id="drawerTitle">会话中心</h2>
         </div>
         <button id="closeDrawerButton" class="icon-button" type="button" aria-label="关闭会话详情">
           <span aria-hidden="true">×</span>
         </button>
       </div>
 
-      <section class="drawer-block">
-        <h3>当前会话</h3>
-        <dl class="detail-list">
-          <div>
-            <dt>会话名</dt>
-            <dd id="drawerSessionName">-</dd>
+      <div class="drawer-body">
+        <section class="drawer-block" aria-labelledby="favoritesTitle">
+          <div class="section-head">
+            <h3 id="favoritesTitle">我的收藏</h3>
+            <div class="drawer-section-actions">
+              <span class="drawer-count-pill" id="favoriteSessionCount">0</span>
+              <button id="favoriteCurrentSession" class="btn-secondary session-favorite-current" type="button">
+                收藏当前
+              </button>
+            </div>
           </div>
-          <div>
-            <dt>会话 ID</dt>
-            <dd id="sessionIdentity">-</dd>
+          <p class="panel-note">星标后在这里直达。</p>
+          <ul id="favoriteSessions" class="favorite-sessions"></ul>
+        </section>
+
+        <section class="drawer-block" aria-labelledby="switchTitle">
+          <div class="section-head">
+            <h3 id="switchTitle">显式切换</h3>
+            <button id="explicitSwitch" class="btn-secondary" type="button">刷新</button>
           </div>
-          <div>
-            <dt>项目路径</dt>
-            <dd id="sessionProjectPath">-</dd>
+          <p class="panel-note">手动选择目标 session，避免静默重绑。</p>
+          <ul id="sessionCandidates" class="session-candidates"></ul>
+        </section>
+
+        <section class="drawer-block" aria-labelledby="auditTitle">
+          <h3 id="auditTitle">切换记录</h3>
+          <ul id="auditList" class="audit-list"></ul>
+        </section>
+
+        <section class="drawer-block" aria-labelledby="securityTitle">
+          <h3 id="securityTitle">权限边界</h3>
+          <p id="securityMode" class="panel-note">mode: unknown</p>
+          <p id="securityAuth" class="panel-note">auth: unknown</p>
+          <p id="executionMode" class="panel-note">execution: unknown</p>
+          <p id="executionSummary" class="panel-note">policy: unknown</p>
+        </section>
+
+        <section class="drawer-block qa-block" aria-labelledby="qaTitle">
+          <div class="section-head">
+            <h3 id="qaTitle">测试工具</h3>
+            <span class="qa-chip">仅测试</span>
           </div>
-        </dl>
-      </section>
-
-      <section class="drawer-block" aria-labelledby="switchTitle">
-        <div class="section-head">
-          <h3 id="switchTitle">显式切换</h3>
-          <button id="explicitSwitch" class="btn-secondary" type="button">刷新列表</button>
-        </div>
-        <p class="panel-note">只允许用户手动选择，不允许 latest-active 或 project-name 静默重绑。</p>
-        <ul id="sessionCandidates" class="session-candidates"></ul>
-      </section>
-
-      <section class="drawer-block" aria-labelledby="auditTitle">
-        <h3 id="auditTitle">Switch Audit</h3>
-        <ul id="auditList" class="audit-list"></ul>
-      </section>
-
-      <section class="drawer-block" aria-labelledby="securityTitle">
-        <h3 id="securityTitle">Auth Boundary</h3>
-        <p id="securityMode" class="panel-note">mode: unknown</p>
-        <p id="securityAuth" class="panel-note">auth: unknown</p>
-        <p id="executionMode" class="panel-note">execution: unknown</p>
-        <p id="executionSummary" class="panel-note">policy: unknown</p>
-      </section>
-
-      <section class="drawer-block qa-block" aria-labelledby="qaTitle">
-        <div class="section-head">
-          <h3 id="qaTitle">QA Mode</h3>
-          <span class="qa-chip">仅测试</span>
-        </div>
-        <div class="qa-actions">
-          <button id="simulateReconnect" class="btn-secondary" type="button">恢复连接</button>
-          <button id="simulateDisconnect" class="btn-secondary" type="button">断流演示</button>
-        </div>
-        <ul class="failures">
-          <li>
-            <button class="btn-danger" type="button" data-failure="connection">触发连接失败</button>
-            <p>验证断流后发送被阻止，并且恢复提示清晰可见。</p>
-          </li>
-          <li>
-            <button class="btn-danger" type="button" data-failure="session">触发附着失败</button>
-            <p>验证重新显式选择会话时不会发生静默回退。</p>
-          </li>
-          <li>
-            <button class="btn-danger" type="button" data-failure="send">触发发送失败</button>
-            <p>验证发送失败时错误只贴近主聊天路径出现。</p>
-          </li>
-        </ul>
-      </section>
+          <div class="qa-actions">
+            <button id="simulateReconnect" class="btn-secondary" type="button">恢复连接</button>
+            <button id="simulateDisconnect" class="btn-secondary" type="button">断流演示</button>
+          </div>
+          <ul class="failures">
+            <li>
+              <button class="btn-danger" type="button" data-failure="connection">触发连接失败</button>
+              <p>验证断流后发送被阻止，并且恢复提示清晰可见。</p>
+            </li>
+            <li>
+              <button class="btn-danger" type="button" data-failure="session">触发附着失败</button>
+              <p>验证重新显式选择会话时不会发生静默回退。</p>
+            </li>
+            <li>
+              <button class="btn-danger" type="button" data-failure="send">触发发送失败</button>
+              <p>验证发送失败时错误只贴近主聊天路径出现。</p>
+            </li>
+          </ul>
+        </section>
+      </div>
 
       <div class="drawer-mobile-dismiss" role="presentation">
         <button

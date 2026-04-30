@@ -1,5 +1,8 @@
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BridgeError, LocalSessionBridge } from "./local-bridge.js";
@@ -17,6 +20,7 @@ const projectRoot = fileURLToPath(new URL("../../", import.meta.url));
 const publicDir = fileURLToPath(new URL("./public/", import.meta.url));
 const auditFilePath = path.join(projectRoot, ".codex2web", "session-audit.jsonl");
 const stateFilePath = path.join(projectRoot, ".codex2web", "session-pin.json");
+const defaultCodexBinaryPath = path.join(os.homedir(), ".bun", "bin", "codex");
 const authEnabled = basicAuthUser.length > 0 && basicAuthPass.length > 0;
 const isHostLocalOnly = host === "127.0.0.1" || host === "::1" || host === "localhost";
 const requiresExternalAuthBoundary = externalMode || !isHostLocalOnly;
@@ -136,6 +140,29 @@ function sendJson(res, statusCode, payload) {
     "content-type": "application/json; charset=utf-8",
   });
   res.end(JSON.stringify(payload));
+}
+
+function commandAvailable(command, args = ["--version"]) {
+  const result = spawnSync(command, args, {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 3000,
+  });
+  return result.status === 0;
+}
+
+function getRuntimeReadiness() {
+  const bunBinDir = path.join(os.homedir(), ".bun", "bin");
+  const pathEntries = String(process.env.PATH || "")
+    .split(":")
+    .filter(Boolean);
+  const effectiveCodexBinaryPath = codexBinaryPath || defaultCodexBinaryPath;
+
+  return {
+    bunAvailable: commandAvailable("bun"),
+    codexBinaryExists: existsSync(effectiveCodexBinaryPath),
+    pathHasBunBin: pathEntries.includes(bunBinDir),
+  };
 }
 
 function decodeBasicAuthHeader(authHeaderValue) {
@@ -290,6 +317,7 @@ async function handleApi(req, res, parsedUrl) {
         host,
         ok: true,
         port,
+        runtime: getRuntimeReadiness(),
         security: {
           authEnabled,
           authMode: authEnabled ? "basic" : "none",
