@@ -1312,7 +1312,18 @@ textarea:focus-visible {
   inset: 0;
   background: rgba(15, 23, 42, 0.3);
   backdrop-filter: blur(2px);
+  opacity: 0;
+  transition: opacity 220ms ease;
   z-index: 20;
+}
+
+.drawer-backdrop.is-open {
+  opacity: 1;
+}
+
+.drawer-backdrop.is-dragging {
+  opacity: var(--drawer-drag-opacity, 0);
+  transition: none;
 }
 
 .session-drawer {
@@ -1329,12 +1340,18 @@ textarea:focus-visible {
   flex-direction: column;
   overflow: hidden;
   transform: translateX(100%);
+  will-change: transform;
   transition: transform 220ms ease;
   z-index: 30;
 }
 
 .session-drawer.is-open {
   transform: translateX(0);
+}
+
+.session-drawer.is-dragging {
+  transform: translateX(var(--drawer-drag-x, 100%));
+  transition: none;
 }
 
 .drawer-head {

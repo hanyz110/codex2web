@@ -124,14 +124,18 @@ const EXTERNAL_STALE_RECONNECT_MS = 12000;
 const EXECUTION_NO_OUTPUT_HINT_MS = 8000;
 const EXECUTION_STALLED_HINT_MS = 20000;
 const DRAWER_EDGE_SWIPE_MAX_WIDTH = 768;
-const DRAWER_EDGE_SWIPE_RIGHT_INSET_PX = 40;
-const DRAWER_EDGE_SWIPE_ZONE_PX = 64;
-const DRAWER_EDGE_SWIPE_MIN_DELTA_X = 64;
-const DRAWER_EDGE_SWIPE_MAX_DELTA_Y = 44;
+const DRAWER_EDGE_SWIPE_RIGHT_INSET_PX = 16;
+const DRAWER_EDGE_SWIPE_ZONE_PX = 108;
+const DRAWER_GESTURE_LOCK_DELTA_PX = 8;
+const DRAWER_GESTURE_MIN_DELTA_X = 56;
+const DRAWER_GESTURE_OPEN_RATIO = 0.38;
+const DRAWER_GESTURE_CLOSE_RATIO = 0.32;
+const DRAWER_GESTURE_FAST_VELOCITY = 0.42;
+const DRAWER_GESTURE_FAST_MIN_DELTA_X = 36;
 let operationLoadingCount = 0;
 let bootStage = "恢复会话";
 let alertAutoHideTimerId = 0;
-let drawerEdgeSwipe = null;
+let drawerGesture = null;
 
 function setText(target, value) {
   if (target) {
@@ -645,8 +649,23 @@ function scrollTranscriptToBottom() {
   updateJumpToLatestVisibility();
 }
 
-function setDrawer(open) {
+function resetDrawerDragStyles() {
+  sessionDrawer?.classList.remove("is-dragging");
+  drawerBackdrop?.classList.remove("is-dragging");
+  sessionDrawer?.style.removeProperty("--drawer-drag-x");
+  drawerBackdrop?.style.removeProperty("--drawer-drag-opacity");
+}
+
+function getDrawerWidth() {
+  return sessionDrawer?.getBoundingClientRect().width || getViewportWidth() || 1;
+}
+
+function setDrawer(open, options = {}) {
+  if (!options.preserveDragStyles) {
+    resetDrawerDragStyles();
+  }
   toggleClass(sessionDrawer, "is-open", open);
+  toggleClass(drawerBackdrop, "is-open", open);
   setAttr(sessionDrawer, "aria-hidden", String(!open));
   setAttr(openDrawerButton, "aria-expanded", String(open));
   setHidden(drawerBackdrop, !open);
@@ -673,8 +692,6 @@ function shouldIgnoreDrawerEdgeSwipeTarget(target) {
   return Boolean(
     target.closest(
       [
-        ".session-drawer",
-        ".drawer-backdrop",
         ".composer-shell",
         "button",
         "textarea",
@@ -687,69 +704,204 @@ function shouldIgnoreDrawerEdgeSwipeTarget(target) {
   );
 }
 
-function handleDrawerEdgeSwipeStart(event) {
-  if (!isMobileDrawerGestureEnabled() || sessionDrawer?.classList.contains("is-open")) {
-    drawerEdgeSwipe = null;
-    return;
-  }
-  if (event.touches.length !== 1) {
-    drawerEdgeSwipe = null;
-    return;
-  }
-  if (shouldIgnoreDrawerEdgeSwipeTarget(event.target)) {
-    drawerEdgeSwipe = null;
+function isInsideDrawer(target) {
+  return target instanceof Element && Boolean(target.closest(".session-drawer"));
+}
+
+function isDrawerOpen() {
+  return Boolean(sessionDrawer?.classList.contains("is-open"));
+}
+
+function updateDrawerDragPosition(deltaX) {
+  if (!drawerGesture) {
     return;
   }
 
-  const touch = event.touches[0];
+  const width = Math.max(drawerGesture.drawerWidth, 1);
+  const translateX = drawerGesture.initialOpen
+    ? Math.min(Math.max(deltaX, 0), width)
+    : Math.min(Math.max(width + deltaX, 0), width);
+  const progress = Math.min(Math.max(1 - translateX / width, 0), 1);
+
+  setHidden(drawerBackdrop, false);
+  sessionDrawer?.classList.add("is-dragging");
+  drawerBackdrop?.classList.add("is-dragging");
+  sessionDrawer?.style.setProperty("--drawer-drag-x", `${translateX}px`);
+  drawerBackdrop?.style.setProperty("--drawer-drag-opacity", String(progress));
+}
+
+function settleDrawerGesture(open) {
+  setDrawer(open, { preserveDragStyles: true });
+  window.requestAnimationFrame(() => {
+    resetDrawerDragStyles();
+  });
+  if (open) {
+    void ensureSessionCatalogLoaded({ silent: true });
+  }
+}
+
+function beginDrawerGesture({ event, point, pointerId = null, input = "touch" }) {
+  if (!isMobileDrawerGestureEnabled()) {
+    drawerGesture = null;
+    return;
+  }
+
   const viewportWidth = getViewportWidth();
+  const drawerOpen = isDrawerOpen();
+  if (!drawerOpen && shouldIgnoreDrawerEdgeSwipeTarget(event.target)) {
+    drawerGesture = null;
+    return;
+  }
+
   const gestureMaxX = viewportWidth - DRAWER_EDGE_SWIPE_RIGHT_INSET_PX;
   const gestureMinX = gestureMaxX - DRAWER_EDGE_SWIPE_ZONE_PX;
-  if (touch.clientX < gestureMinX || touch.clientX > gestureMaxX) {
-    drawerEdgeSwipe = null;
+  const canStartClosedGesture = !drawerOpen && point.clientX >= gestureMinX && point.clientX <= gestureMaxX;
+  const canStartOpenGesture = drawerOpen && isInsideDrawer(event.target);
+  if (!canStartClosedGesture && !canStartOpenGesture) {
+    drawerGesture = null;
     return;
   }
 
-  drawerEdgeSwipe = {
-    lastX: touch.clientX,
-    lastY: touch.clientY,
-    startX: touch.clientX,
-    startY: touch.clientY,
+  drawerGesture = {
+    drawerWidth: getDrawerWidth(),
+    initialOpen: drawerOpen,
+    input,
+    lastMoveAt: event.timeStamp,
+    lastX: point.clientX,
+    lastY: point.clientY,
+    locked: false,
+    pointerId,
+    startX: point.clientX,
+    startY: point.clientY,
+    velocityX: 0,
   };
 }
 
-function handleDrawerEdgeSwipeMove(event) {
-  if (!drawerEdgeSwipe || event.touches.length !== 1) {
+function updateDrawerGestureMove({ event, point }) {
+  if (!drawerGesture) {
     return;
   }
 
-  const touch = event.touches[0];
-  drawerEdgeSwipe.lastX = touch.clientX;
-  drawerEdgeSwipe.lastY = touch.clientY;
+  const deltaX = point.clientX - drawerGesture.startX;
+  const deltaY = point.clientY - drawerGesture.startY;
+  const elapsedMs = Math.max(event.timeStamp - drawerGesture.lastMoveAt, 1);
+  drawerGesture.velocityX = (point.clientX - drawerGesture.lastX) / elapsedMs;
+  drawerGesture.lastMoveAt = event.timeStamp;
+  drawerGesture.lastX = point.clientX;
+  drawerGesture.lastY = point.clientY;
+
+  if (!drawerGesture.locked) {
+    const horizontal = Math.abs(deltaX);
+    const vertical = Math.abs(deltaY);
+    if (horizontal < DRAWER_GESTURE_LOCK_DELTA_PX && vertical < DRAWER_GESTURE_LOCK_DELTA_PX) {
+      return;
+    }
+    if (vertical > horizontal * 1.05) {
+      drawerGesture = null;
+      return;
+    }
+    drawerGesture.locked = true;
+  }
+
+  event.preventDefault();
+  updateDrawerDragPosition(deltaX);
 }
 
 function handleDrawerEdgeSwipeEnd() {
-  if (!drawerEdgeSwipe) {
+  if (!drawerGesture) {
     return;
   }
 
-  const deltaX = drawerEdgeSwipe.lastX - drawerEdgeSwipe.startX;
-  const deltaY = drawerEdgeSwipe.lastY - drawerEdgeSwipe.startY;
-  const isHorizontalSwipe = Math.abs(deltaX) > Math.abs(deltaY) * 1.35;
-  const isOpenGesture =
-    deltaX <= -DRAWER_EDGE_SWIPE_MIN_DELTA_X &&
-    Math.abs(deltaY) <= DRAWER_EDGE_SWIPE_MAX_DELTA_Y &&
-    isHorizontalSwipe;
-
-  drawerEdgeSwipe = null;
-
-  if (isOpenGesture) {
-    openDrawerWithSessionCatalog();
+  const gesture = drawerGesture;
+  drawerGesture = null;
+  if (!gesture.locked) {
+    resetDrawerDragStyles();
+    return;
   }
+
+  const deltaX = gesture.lastX - gesture.startX;
+  const openingDistance = Math.max(-deltaX, 0);
+  const closingDistance = Math.max(deltaX, 0);
+  const openingRatio = openingDistance / Math.max(gesture.drawerWidth, 1);
+  const closingRatio = closingDistance / Math.max(gesture.drawerWidth, 1);
+  const velocityX = gesture.velocityX;
+  const shouldOpen = !gesture.initialOpen
+    ? openingDistance >= DRAWER_GESTURE_MIN_DELTA_X ||
+      openingRatio >= DRAWER_GESTURE_OPEN_RATIO ||
+      (openingDistance >= DRAWER_GESTURE_FAST_MIN_DELTA_X && velocityX <= -DRAWER_GESTURE_FAST_VELOCITY)
+    : !(
+      closingDistance >= DRAWER_GESTURE_MIN_DELTA_X ||
+      closingRatio >= DRAWER_GESTURE_CLOSE_RATIO ||
+      (closingDistance >= DRAWER_GESTURE_FAST_MIN_DELTA_X && velocityX >= DRAWER_GESTURE_FAST_VELOCITY)
+    );
+
+  settleDrawerGesture(shouldOpen);
 }
 
 function handleDrawerEdgeSwipeCancel() {
-  drawerEdgeSwipe = null;
+  const shouldOpen = drawerGesture?.initialOpen;
+  drawerGesture = null;
+  settleDrawerGesture(Boolean(shouldOpen));
+}
+
+function handleDrawerEdgeSwipeStart(event) {
+  if (drawerGesture?.input === "pointer") {
+    return;
+  }
+  if (event.touches.length !== 1) {
+    drawerGesture = null;
+    return;
+  }
+
+  beginDrawerGesture({ event, point: event.touches[0], input: "touch" });
+}
+
+function handleDrawerEdgeSwipeMove(event) {
+  if (!drawerGesture || drawerGesture.input !== "touch" || event.touches.length !== 1) {
+    return;
+  }
+
+  updateDrawerGestureMove({ event, point: event.touches[0] });
+}
+
+function handleDrawerPointerStart(event) {
+  if (!event.isPrimary || event.button !== 0) {
+    drawerGesture = null;
+    return;
+  }
+
+  beginDrawerGesture({ event, point: event, pointerId: event.pointerId, input: "pointer" });
+  if (drawerGesture && event.target instanceof Element && typeof event.target.setPointerCapture === "function") {
+    try {
+      event.target.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is a best-effort improvement for drags leaving the start target.
+    }
+  }
+}
+
+function handleDrawerPointerMove(event) {
+  if (!drawerGesture || drawerGesture.input !== "pointer" || event.pointerId !== drawerGesture.pointerId) {
+    return;
+  }
+
+  updateDrawerGestureMove({ event, point: event });
+}
+
+function handleDrawerPointerEnd(event) {
+  if (!drawerGesture || drawerGesture.input !== "pointer" || event.pointerId !== drawerGesture.pointerId) {
+    return;
+  }
+
+  handleDrawerEdgeSwipeEnd();
+}
+
+function handleDrawerPointerCancel(event) {
+  if (!drawerGesture || drawerGesture.input !== "pointer" || event.pointerId !== drawerGesture.pointerId) {
+    return;
+  }
+
+  handleDrawerEdgeSwipeCancel();
 }
 
 function setQuickCommandMenu(open) {
@@ -1770,9 +1922,13 @@ drawerOpeners.forEach((button) =>
 jumpToLatestButton?.addEventListener("click", () => scrollTranscriptToBottom());
 
 document.addEventListener("touchstart", handleDrawerEdgeSwipeStart, { passive: true });
-document.addEventListener("touchmove", handleDrawerEdgeSwipeMove, { passive: true });
+document.addEventListener("touchmove", handleDrawerEdgeSwipeMove, { passive: false });
 document.addEventListener("touchend", handleDrawerEdgeSwipeEnd, { passive: true });
 document.addEventListener("touchcancel", handleDrawerEdgeSwipeCancel, { passive: true });
+document.addEventListener("pointerdown", handleDrawerPointerStart);
+document.addEventListener("pointermove", handleDrawerPointerMove);
+document.addEventListener("pointerup", handleDrawerPointerEnd);
+document.addEventListener("pointercancel", handleDrawerPointerCancel);
 
 transcriptList?.addEventListener("scroll", () => {
   shouldStickToBottom = isNearBottom();
