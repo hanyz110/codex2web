@@ -839,9 +839,7 @@ function handleDrawerEdgeSwipeEnd() {
 }
 
 function handleDrawerEdgeSwipeCancel() {
-  const shouldOpen = drawerGesture?.initialOpen;
-  drawerGesture = null;
-  settleDrawerGesture(Boolean(shouldOpen));
+  handleDrawerEdgeSwipeEnd();
 }
 
 function handleDrawerEdgeSwipeStart(event) {
@@ -867,6 +865,9 @@ function handleDrawerEdgeSwipeMove(event) {
 function handleDrawerPointerStart(event) {
   if (!event.isPrimary || event.button !== 0) {
     drawerGesture = null;
+    return;
+  }
+  if (event.pointerType === "touch") {
     return;
   }
 
