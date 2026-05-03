@@ -86,6 +86,9 @@ const operationLoadingText = document.querySelector("#operationLoadingText");
 const quickCommandButton = document.querySelector("#quickCommandButton");
 const quickCommandMenu = document.querySelector("#quickCommandMenu");
 const quickCommandItems = document.querySelectorAll("[data-quick-command]");
+const attachImageButton = document.querySelector("#attachImageButton");
+const imageInput = document.querySelector("#imageInput");
+const imagePreviewList = document.querySelector("#imagePreviewList");
 
 const badgeElements = {
   attach: document.querySelector("#attachBadge"),
@@ -95,6 +98,7 @@ const badgeElements = {
 };
 
 const seenMessageIds = new Set();
+const optimisticMessageIds = new Set();
 const expandedProjectPaths = new Set();
 let stream = null;
 let hadStreamError = false;
@@ -132,10 +136,19 @@ const DRAWER_GESTURE_OPEN_RATIO = 0.38;
 const DRAWER_GESTURE_CLOSE_RATIO = 0.32;
 const DRAWER_GESTURE_FAST_VELOCITY = 0.42;
 const DRAWER_GESTURE_FAST_MIN_DELTA_X = 36;
+const OPTIMISTIC_MESSAGE_TTL_MS = 45000;
+const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGE_TOTAL_BYTES = 12 * 1024 * 1024;
+const IMAGE_COMPRESS_TARGET_BYTES = 4.5 * 1024 * 1024;
+const IMAGE_COMPRESS_MAX_EDGE = 1600;
+const IMAGE_COMPRESS_MIN_EDGE = 512;
+const SUPPORTED_IMAGE_TYPES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
 let operationLoadingCount = 0;
 let bootStage = "恢复会话";
 let alertAutoHideTimerId = 0;
 let drawerGesture = null;
+let pendingImages = [];
 
 function setText(target, value) {
   if (target) {
@@ -964,6 +977,285 @@ function delay(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0B";
+  }
+
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024))}KB`;
+  }
+
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function readBlobAsDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result || "")));
+    reader.addEventListener("error", () => reject(new Error("图片读取失败，请重试。")));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function blobFromCanvas(canvas, type, quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) {
+          resolve(blob);
+          return;
+        }
+        reject(new Error("图片压缩失败，请重试。"));
+      },
+      type,
+      quality,
+    );
+  });
+}
+
+function replaceImageExtension(name, extension) {
+  const safeName = String(name || "image").trim() || "image";
+  return safeName.replace(/\.[^.]+$/, "") + extension;
+}
+
+async function decodeImageSource(file) {
+  if (window.createImageBitmap) {
+    const bitmap = await window.createImageBitmap(file);
+    return {
+      close: () => bitmap.close?.(),
+      height: bitmap.height,
+      source: bitmap,
+      width: bitmap.width,
+    };
+  }
+
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = await new Promise((resolve, reject) => {
+      const element = new Image();
+      element.addEventListener("load", () => resolve(element), { once: true });
+      element.addEventListener("error", () => reject(new Error("图片解码失败，请换一张图片重试。")), { once: true });
+      element.src = objectUrl;
+    });
+    return {
+      close: () => URL.revokeObjectURL(objectUrl),
+      height: image.naturalHeight || image.height,
+      source: image,
+      width: image.naturalWidth || image.width,
+    };
+  } catch (error) {
+    URL.revokeObjectURL(objectUrl);
+    throw error;
+  }
+}
+
+async function compressImageFile(file, targetBytes = IMAGE_COMPRESS_TARGET_BYTES) {
+  const normalizedTarget = Math.min(MAX_IMAGE_BYTES, Math.max(256 * 1024, targetBytes));
+  if (file.size <= normalizedTarget) {
+    return {
+      blob: file,
+      compressed: false,
+      name: file.name || "image",
+      originalSize: file.size,
+      type: file.type,
+    };
+  }
+
+  const decoded = await decodeImageSource(file);
+  try {
+    if (!decoded.width || !decoded.height) {
+      throw new Error("图片尺寸无效，无法压缩。");
+    }
+
+    const longestEdge = Math.max(decoded.width, decoded.height);
+    const edgeTargets = [1600, 1280, 1024, 800, 640, IMAGE_COMPRESS_MIN_EDGE]
+      .filter((edge, index, list) => edge <= IMAGE_COMPRESS_MAX_EDGE && list.indexOf(edge) === index);
+    const qualities = [0.82, 0.76, 0.7, 0.64, 0.58, 0.52];
+    let bestBlob = null;
+
+    for (const edge of edgeTargets) {
+      const scale = Math.min(1, edge / longestEdge);
+      const width = Math.max(1, Math.round(decoded.width * scale));
+      const height = Math.max(1, Math.round(decoded.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { alpha: false });
+      if (!context) {
+        throw new Error("当前浏览器不支持图片压缩。");
+      }
+
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, width, height);
+      context.drawImage(decoded.source, 0, 0, width, height);
+
+      for (const quality of qualities) {
+        const blob = await blobFromCanvas(canvas, "image/jpeg", quality);
+        if (!bestBlob || blob.size < bestBlob.size) {
+          bestBlob = blob;
+        }
+        if (blob.size <= normalizedTarget) {
+          return {
+            blob,
+            compressed: true,
+            name: replaceImageExtension(file.name, ".jpg"),
+            originalSize: file.size,
+            type: "image/jpeg",
+          };
+        }
+      }
+    }
+
+    if (!bestBlob) {
+      throw new Error("图片压缩失败，请重试。");
+    }
+
+    return {
+      blob: bestBlob,
+      compressed: true,
+      name: replaceImageExtension(file.name, ".jpg"),
+      originalSize: file.size,
+      type: "image/jpeg",
+    };
+  } finally {
+    decoded.close();
+  }
+}
+
+function renderImagePreviewList() {
+  if (!imagePreviewList) {
+    return;
+  }
+
+  imagePreviewList.innerHTML = "";
+  imagePreviewList.hidden = pendingImages.length === 0;
+
+  for (const image of pendingImages) {
+    const item = document.createElement("div");
+    item.className = "image-preview-item";
+
+    const img = document.createElement("img");
+    img.src = image.previewUrl;
+    img.alt = image.name ? `待发送图片：${image.name}` : "待发送图片";
+    img.loading = "lazy";
+
+    const meta = document.createElement("span");
+    meta.className = "image-preview-meta";
+    meta.textContent = image.compressed
+      ? `${image.name || "图片"} · ${formatBytes(image.originalSize)}→${formatBytes(image.size)}`
+      : `${image.name || "图片"} · ${formatBytes(image.size)}`;
+
+    const removeButton = document.createElement("button");
+    removeButton.className = "image-preview-remove";
+    removeButton.type = "button";
+    removeButton.setAttribute("aria-label", `移除图片 ${image.name || ""}`.trim());
+    removeButton.dataset.imageId = image.id;
+    removeButton.textContent = "×";
+
+    item.append(img, meta, removeButton);
+    imagePreviewList.append(item);
+  }
+
+  syncComposerOffset();
+}
+
+function clearPendingImages() {
+  for (const image of pendingImages) {
+    if (image.previewUrl) {
+      URL.revokeObjectURL(image.previewUrl);
+    }
+  }
+  pendingImages = [];
+  if (imageInput) {
+    imageInput.value = "";
+  }
+  renderImagePreviewList();
+}
+
+function removePendingImage(imageId) {
+  const target = pendingImages.find((image) => image.id === imageId);
+  if (target?.previewUrl) {
+    URL.revokeObjectURL(target.previewUrl);
+  }
+  pendingImages = pendingImages.filter((image) => image.id !== imageId);
+  renderImagePreviewList();
+}
+
+async function addPendingImages(files) {
+  const candidates = Array.from(files || []);
+  if (candidates.length === 0) {
+    return;
+  }
+
+  const availableSlots = MAX_IMAGE_ATTACHMENTS - pendingImages.length;
+  if (availableSlots <= 0) {
+    setAlert(`最多一次发送 ${String(MAX_IMAGE_ATTACHMENTS)} 张图片。`);
+    return;
+  }
+
+  const accepted = [];
+  for (const file of candidates.slice(0, availableSlots)) {
+    if (!SUPPORTED_IMAGE_TYPES.has(file.type)) {
+      setAlert("仅支持 PNG、JPEG、WebP、GIF 图片。");
+      continue;
+    }
+
+    if (file.size <= 0) {
+      setAlert("图片文件为空，请换一张图片。");
+      continue;
+    }
+
+    accepted.push(file);
+  }
+
+  if (candidates.length > availableSlots) {
+    setAlert(`最多一次发送 ${String(MAX_IMAGE_ATTACHMENTS)} 张图片，已忽略超出的图片。`);
+  }
+
+  let compressedCount = 0;
+  for (const file of accepted) {
+    const currentTotalBytes = pendingImages.reduce((sum, image) => sum + image.size, 0);
+    const remainingTotalBytes = Math.max(256 * 1024, MAX_IMAGE_TOTAL_BYTES - currentTotalBytes);
+    const targetBytes = Math.min(IMAGE_COMPRESS_TARGET_BYTES, remainingTotalBytes);
+    const prepared = await compressImageFile(file, targetBytes);
+
+    if (prepared.blob.size > MAX_IMAGE_BYTES || currentTotalBytes + prepared.blob.size > MAX_IMAGE_TOTAL_BYTES) {
+      const retryTarget = Math.min(MAX_IMAGE_BYTES, Math.max(256 * 1024, MAX_IMAGE_TOTAL_BYTES - currentTotalBytes));
+      const retried = await compressImageFile(prepared.blob, retryTarget);
+      if (retried.blob.size > MAX_IMAGE_BYTES || currentTotalBytes + retried.blob.size > MAX_IMAGE_TOTAL_BYTES) {
+        setAlert("图片已尝试压缩，但仍超过本次可发送容量，请减少图片数量后重试。");
+        continue;
+      }
+      prepared.blob = retried.blob;
+      prepared.compressed = true;
+      prepared.name = replaceImageExtension(prepared.name, ".jpg");
+      prepared.type = "image/jpeg";
+    }
+
+    const dataUrl = await readBlobAsDataUrl(prepared.blob);
+    const base64 = dataUrl.includes(",") ? dataUrl.split(",").pop() || "" : dataUrl;
+    if (prepared.compressed) {
+      compressedCount += 1;
+    }
+    pendingImages.push({
+      data: base64,
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      compressed: prepared.compressed,
+      name: prepared.name,
+      originalSize: prepared.originalSize,
+      previewUrl: URL.createObjectURL(prepared.blob),
+      size: prepared.blob.size,
+      type: prepared.type,
+    });
+  }
+
+  if (accepted.length > 0) {
+    setAlert(compressedCount > 0 ? `已自动压缩 ${String(compressedCount)} 张图片，可与文字一起发送。` : "");
+    renderImagePreviewList();
+  }
+}
+
 function setBootLoading(loading, message, detail) {
   if (bootLoadingTitle && message) {
     bootLoadingTitle.textContent = message;
@@ -1117,6 +1409,9 @@ function renderTranscript() {
   for (const entry of state.transcript) {
     const item = document.createElement("li");
     item.className = `message ${entry.role}`;
+    if (entry.pending) {
+      item.classList.add("is-pending");
+    }
 
     const row = document.createElement("div");
     row.className = "message-row";
@@ -1133,7 +1428,7 @@ function renderTranscript() {
 
     const time = document.createElement("span");
     time.className = "timestamp";
-    time.textContent = formatTime(entry.time);
+    time.textContent = entry.pending ? "发送中" : formatTime(entry.time);
 
     const body = document.createElement("div");
     body.className = "message-body";
@@ -1550,10 +1845,14 @@ function updateBinding(binding) {
 }
 
 function replaceTranscript(entries) {
-  state.transcript = entries.slice();
+  state.transcript = mergeEntriesWithOptimistic(entries);
   seenMessageIds.clear();
-  for (const entry of entries) {
+  optimisticMessageIds.clear();
+  for (const entry of state.transcript) {
     seenMessageIds.add(entry.id);
+    if (entry.pending) {
+      optimisticMessageIds.add(entry.id);
+    }
   }
   shouldStickToBottom = true;
   renderTranscript();
@@ -1592,7 +1891,13 @@ function reconcileTranscript(entries) {
 }
 
 function getLatestTranscriptId() {
-  return state.transcript.at(-1)?.id || "";
+  for (let index = state.transcript.length - 1; index >= 0; index -= 1) {
+    if (!state.transcript[index]?.pending) {
+      return state.transcript[index].id || "";
+    }
+  }
+
+  return "";
 }
 
 function appendMessage(entry) {
@@ -1600,8 +1905,91 @@ function appendMessage(entry) {
     return;
   }
 
+  removeMatchingOptimisticMessage(entry);
   seenMessageIds.add(entry.id);
   state.transcript.push(entry);
+  renderTranscript();
+}
+
+function normalizeMessageText(value) {
+  return String(value || "").trim().replace(/\s+/g, " ");
+}
+
+function findMatchingOptimisticMessage(entry) {
+  if (entry?.role !== "user") {
+    return null;
+  }
+
+  const text = normalizeMessageText(entry.text);
+  if (!text) {
+    return null;
+  }
+
+  return state.transcript.find(
+    (candidate) =>
+      candidate.pending &&
+      candidate.role === "user" &&
+      normalizeMessageText(candidate.text) === text,
+  ) || null;
+}
+
+function removeMatchingOptimisticMessage(entry) {
+  const optimisticEntry = findMatchingOptimisticMessage(entry);
+  if (!optimisticEntry) {
+    return;
+  }
+
+  optimisticMessageIds.delete(optimisticEntry.id);
+  seenMessageIds.delete(optimisticEntry.id);
+  state.transcript = state.transcript.filter((candidate) => candidate.id !== optimisticEntry.id);
+}
+
+function mergeEntriesWithOptimistic(entries) {
+  const realEntries = Array.isArray(entries) ? entries.slice() : [];
+  const realTextByRole = new Set(
+    realEntries.map((entry) => `${entry.role}:${normalizeMessageText(entry.text)}`),
+  );
+  const activeOptimisticEntries = state.transcript.filter((entry) => {
+    if (!entry.pending) {
+      return false;
+    }
+
+    if (Date.now() - Date.parse(entry.time) > OPTIMISTIC_MESSAGE_TTL_MS) {
+      return false;
+    }
+
+    return !realTextByRole.has(`${entry.role}:${normalizeMessageText(entry.text)}`);
+  });
+
+  return [...realEntries, ...activeOptimisticEntries];
+}
+
+function appendOptimisticUserMessage(text, { imageCount = 0 } = {}) {
+  const entry = {
+    id: `optimistic:${Date.now()}:${Math.random().toString(16).slice(2)}`,
+    imageCount,
+    pending: true,
+    role: "user",
+    text,
+    time: new Date().toISOString(),
+  };
+
+  optimisticMessageIds.add(entry.id);
+  seenMessageIds.add(entry.id);
+  state.transcript.push(entry);
+  shouldStickToBottom = true;
+  renderTranscript();
+  return entry.id;
+}
+
+function removeOptimisticMessage(messageId) {
+  if (!messageId || !optimisticMessageIds.has(messageId)) {
+    return;
+  }
+
+  optimisticMessageIds.delete(messageId);
+  seenMessageIds.delete(messageId);
+  state.transcript = state.transcript.filter((entry) => entry.id !== messageId);
   renderTranscript();
 }
 
@@ -2020,6 +2408,36 @@ quickCommandMenu?.addEventListener("click", (event) => {
   insertQuickCommand(commandButton.dataset.quickCommand || "");
 });
 
+attachImageButton?.addEventListener("click", () => {
+  imageInput?.click();
+});
+
+imageInput?.addEventListener("change", async () => {
+  try {
+    await addPendingImages(imageInput.files);
+  } catch (error) {
+    setAlert(error.message || "图片添加失败。");
+  } finally {
+    if (imageInput) {
+      imageInput.value = "";
+    }
+  }
+});
+
+imagePreviewList?.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  const removeButton = target.closest("[data-image-id]");
+  if (!(removeButton instanceof HTMLElement)) {
+    return;
+  }
+
+  removePendingImage(removeButton.dataset.imageId || "");
+});
+
 document.addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof Node)) {
@@ -2278,6 +2696,14 @@ async function sendCurrentMessage() {
   }
 
   state.send = "sending";
+  const imagesForSend = pendingImages.map((image) => ({
+    data: image.data,
+    name: image.name,
+    type: image.type,
+  }));
+  const optimisticMessageId = appendOptimisticUserMessage(value, { imageCount: imagesForSend.length });
+  composerInput.value = "";
+  autoResizeComposer();
   state.executionState = {
     acceptedAt: null,
     exitCode: null,
@@ -2294,14 +2720,19 @@ async function sendCurrentMessage() {
 
   try {
     await requestJson("/api/session/send", {
-      body: JSON.stringify({ message: value }),
+      body: JSON.stringify({
+        images: imagesForSend,
+        message: value,
+      }),
       headers: { "content-type": "application/json" },
       method: "POST",
     });
     await syncBindingSnapshot({ silent: true });
-    composerInput.value = "";
-    autoResizeComposer();
+    clearPendingImages();
   } catch (error) {
+    removeOptimisticMessage(optimisticMessageId);
+    composerInput.value = value;
+    autoResizeComposer();
     state.send = "error";
     renderState();
     setAlert(error.message);

@@ -59,6 +59,21 @@ npm run external:trusted -- --port 4422
 5. wait for transcript updates
 6. use `Stop` if the in-flight execution should be cancelled
 
+## Image + Text Prompts
+
+Use the image button in the composer to attach images, then type the prompt text and send. The text and images are sent to the same resumed Codex session in one turn.
+
+Phone photos are compressed locally in the browser before upload when needed. If compression happens, the preview shows the original size and compressed size.
+
+Limits:
+
+1. supported formats: PNG, JPEG, WebP, GIF
+2. maximum images per send: 4
+3. maximum single image size: 5MB
+4. maximum total image size per send: 12MB
+
+Attachments are saved locally under `.codex2web/uploads/` and passed to Codex CLI as `--image` arguments.
+
 ## Switching Sessions
 
 1. open the drawer

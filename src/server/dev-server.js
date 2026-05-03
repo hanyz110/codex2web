@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +21,7 @@ const projectRoot = fileURLToPath(new URL("../../", import.meta.url));
 const publicDir = fileURLToPath(new URL("./public/", import.meta.url));
 const auditFilePath = path.join(projectRoot, ".codex2web", "session-audit.jsonl");
 const stateFilePath = path.join(projectRoot, ".codex2web", "session-pin.json");
+const uploadDir = path.join(projectRoot, ".codex2web", "uploads");
 const defaultCodexBinaryPath = path.join(os.homedir(), ".bun", "bin", "codex");
 const authEnabled = basicAuthUser.length > 0 && basicAuthPass.length > 0;
 const isHostLocalOnly = host === "127.0.0.1" || host === "::1" || host === "localhost";
@@ -114,6 +116,16 @@ const contentTypeByExt = {
 };
 
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_SEND_BODY_BYTES = 16 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGE_TOTAL_BYTES = 12 * 1024 * 1024;
+const IMAGE_TYPES = new Map([
+  ["image/gif", { ext: ".gif", magic: (buffer) => buffer.subarray(0, 6).toString("ascii") === "GIF87a" || buffer.subarray(0, 6).toString("ascii") === "GIF89a" }],
+  ["image/jpeg", { ext: ".jpg", magic: (buffer) => buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff }],
+  ["image/png", { ext: ".png", magic: (buffer) => buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) }],
+  ["image/webp", { ext: ".webp", magic: (buffer) => buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP" }],
+]);
 const NO_STORE_HEADERS = {
   "cache-control": "private, no-cache, no-store, must-revalidate, max-age=0",
   expires: "0",
@@ -211,13 +223,13 @@ function sendSseEvent(res, eventName, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
-async function readJsonBody(req) {
+async function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
   const chunks = [];
   let totalBytes = 0;
 
   for await (const chunk of req) {
     totalBytes += chunk.length;
-    if (totalBytes > MAX_BODY_BYTES) {
+    if (totalBytes > maxBytes) {
       throw new BridgeError(413, "Request body too large.", "BODY_TOO_LARGE");
     }
     chunks.push(chunk);
@@ -233,6 +245,70 @@ async function readJsonBody(req) {
   } catch {
     throw new BridgeError(400, "Invalid JSON body.", "INVALID_JSON");
   }
+}
+
+function decodeBase64ImageData(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new BridgeError(400, "Image data is required.", "INVALID_IMAGE_DATA");
+  }
+
+  const commaIndex = value.indexOf(",");
+  const base64 = value.startsWith("data:") && commaIndex >= 0 ? value.slice(commaIndex + 1) : value;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64) || base64.length % 4 !== 0) {
+    throw new BridgeError(400, "Image data must be valid base64.", "INVALID_IMAGE_DATA");
+  }
+
+  return Buffer.from(base64, "base64");
+}
+
+async function persistImageAttachments(images) {
+  if (images == null) {
+    return [];
+  }
+
+  if (!Array.isArray(images)) {
+    throw new BridgeError(400, "Images must be an array.", "INVALID_IMAGES");
+  }
+
+  if (images.length > MAX_IMAGE_ATTACHMENTS) {
+    throw new BridgeError(400, `最多一次发送 ${MAX_IMAGE_ATTACHMENTS} 张图片。`, "TOO_MANY_IMAGES");
+  }
+
+  if (images.length === 0) {
+    return [];
+  }
+
+  await mkdir(uploadDir, { recursive: true });
+  const savedPaths = [];
+  let totalBytes = 0;
+
+  for (const image of images) {
+    const type = typeof image?.type === "string" ? image.type.toLowerCase() : "";
+    const config = IMAGE_TYPES.get(type);
+    if (!config) {
+      throw new BridgeError(400, "仅支持 PNG、JPEG、WebP、GIF 图片。", "UNSUPPORTED_IMAGE_TYPE");
+    }
+
+    const buffer = decodeBase64ImageData(image.data);
+    if (buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) {
+      throw new BridgeError(400, "单张图片必须大于 0 且不超过 5MB。", "IMAGE_TOO_LARGE");
+    }
+
+    totalBytes += buffer.length;
+    if (totalBytes > MAX_IMAGE_TOTAL_BYTES) {
+      throw new BridgeError(400, "图片总大小不能超过 12MB。", "IMAGES_TOO_LARGE");
+    }
+
+    if (!config.magic(buffer)) {
+      throw new BridgeError(400, "图片内容与声明类型不一致。", "INVALID_IMAGE_CONTENT");
+    }
+
+    const filePath = path.join(uploadDir, `${Date.now()}-${randomUUID()}${config.ext}`);
+    await writeFile(filePath, buffer, { mode: 0o600 });
+    savedPaths.push(filePath);
+  }
+
+  return savedPaths;
 }
 
 function toErrorPayload(error) {
@@ -340,8 +416,9 @@ async function handleApi(req, res, parsedUrl) {
     }
 
     if (method === "POST" && pathname === "/api/session/send") {
-      const body = await readJsonBody(req);
-      const result = await bridge.sendInput(body.message);
+      const body = await readJsonBody(req, MAX_SEND_BODY_BYTES);
+      const imagePaths = await persistImageAttachments(body.images);
+      const result = await bridge.sendInput(body.message, { imagePaths });
       sendJson(res, 200, { ok: true, result });
       return;
     }

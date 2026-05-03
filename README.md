@@ -30,6 +30,7 @@ Codex2Web is useful if you want:
 5. local vs external execution mode visibility
 6. HTTP Basic Auth protection for external access
 7. optional `remote-trusted` mode for local-equivalent dangerous execution on remote browsers
+8. image + text prompt sending through Codex CLI image attachments
 
 ## Requirements
 
@@ -93,6 +94,21 @@ Defaults:
 1. local mode defaults to `dangerous`
 2. external mode defaults to `full-auto`
 3. external `dangerous` is blocked unless you explicitly enable `--remote-trusted`
+
+## Image Prompts
+
+The chat composer supports sending prompt text with image attachments in the same turn.
+
+Large phone photos are compressed in the browser before upload. The preview shows the original and compressed sizes when compression happens.
+
+Limits:
+
+1. supported formats: PNG, JPEG, WebP, GIF
+2. maximum images per send: 4
+3. maximum single image size: 5MB
+4. maximum total image size per send: 12MB
+
+Images are stored locally under `.codex2web/uploads/` and passed to Codex CLI with `--image <file>`. They are not committed to git because `.codex2web/` is ignored.
 
 ## External Access
 

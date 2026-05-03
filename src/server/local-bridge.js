@@ -713,8 +713,11 @@ export class LocalSessionBridge {
     return this.getBinding();
   }
 
-  async sendInput(message) {
+  async sendInput(message, options = {}) {
     const trimmed = trimText(message);
+    const imagePaths = Array.isArray(options?.imagePaths)
+      ? options.imagePaths.map((filePath) => normalizePath(filePath)).filter(Boolean)
+      : [];
     if (!trimmed || trimmed.length < 2) {
       throw new BridgeError(400, "Message must be at least 2 characters.", "INVALID_MESSAGE");
     }
@@ -750,16 +753,20 @@ export class LocalSessionBridge {
       phase: "starting",
       processAlive: false,
       startedAt: nowIso(),
-      statusDetail: "指令已发送，正在启动 Codex 执行。",
+      statusDetail:
+        imagePaths.length > 0
+          ? `指令已发送，已附加 ${String(imagePaths.length)} 张图片，正在启动 Codex 执行。`
+          : "指令已发送，正在启动 Codex 执行。",
     }, { emit: false });
     this.#sendingSessionIds.add(session.id);
     this.#emit("state", this.getBinding());
 
     try {
-      const result = await this.#startResumeProcess(session, trimmed);
+      const result = await this.#startResumeProcess(session, trimmed, { imagePaths });
       return {
         ...result,
         acceptedAt: nowIso(),
+        imageCount: imagePaths.length,
       };
     } catch (error) {
       this.#sendingSessionIds.delete(session.id);
@@ -824,11 +831,12 @@ export class LocalSessionBridge {
     };
   }
 
-  async #startResumeProcess(session, prompt) {
+  async #startResumeProcess(session, prompt, { imagePaths = [] } = {}) {
     let accepted = false;
     let timeoutId = null;
 
     return new Promise((resolve, reject) => {
+      const imageArgs = imagePaths.flatMap((filePath) => ["--image", filePath]);
       const child = spawn(
         this.#codexBinaryPath,
         [
@@ -837,6 +845,7 @@ export class LocalSessionBridge {
           ...this.#executionPolicy.cliArgs,
           "--skip-git-repo-check",
           "--json",
+          ...imageArgs,
           session.id,
           "-",
         ],
@@ -865,8 +874,8 @@ export class LocalSessionBridge {
         pid: child.pid || null,
         processAlive: true,
         statusDetail: child.pid
-          ? `Codex 执行进程已启动（PID ${String(child.pid)}），等待确认接收。`
-          : "Codex 执行进程已启动，等待确认接收。",
+          ? `Codex 执行进程已启动（PID ${String(child.pid)}），${imagePaths.length > 0 ? `已附加 ${String(imagePaths.length)} 张图片，` : ""}等待确认接收。`
+          : `Codex 执行进程已启动，${imagePaths.length > 0 ? `已附加 ${String(imagePaths.length)} 张图片，` : ""}等待确认接收。`,
       }, { emit: false });
       this.#emit("state", this.getBinding());
       this.#startRunWatchdog(session, runContext);
@@ -886,10 +895,12 @@ export class LocalSessionBridge {
           processAlive: true,
           statusDetail: runContext.stopRequested
             ? "停止请求已发出，等待执行进程退出。"
-            : "指令已被 Codex 接收，等待输出进入信息流。",
+            : imagePaths.length > 0
+              ? `指令和 ${String(imagePaths.length)} 张图片已被 Codex 接收，等待输出进入信息流。`
+              : "指令已被 Codex 接收，等待输出进入信息流。",
         }, { emit: false });
         this.#emit("state", this.getBinding());
-        resolve({ sessionId: session.id });
+        resolve({ imageCount: imagePaths.length, sessionId: session.id });
       };
 
       const fail = (message) => {

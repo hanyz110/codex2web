@@ -776,6 +776,31 @@ h3 {
   color: var(--text);
 }
 
+.message.is-pending {
+  animation: pending-message-in 160ms ease-out;
+}
+
+.message.is-pending .message-content {
+  opacity: 0.72;
+}
+
+.message.is-pending .timestamp {
+  color: var(--primary);
+  font-weight: 650;
+}
+
+@keyframes pending-message-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .message-body > :first-child {
   margin-top: 0;
 }
@@ -1003,6 +1028,81 @@ h3 {
   box-shadow: var(--ring);
 }
 
+.image-preview-list {
+  display: flex;
+  gap: 8px;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 1px 1px 3px;
+  scrollbar-width: none;
+}
+
+.image-preview-list[hidden] {
+  display: none;
+}
+
+.image-preview-list::-webkit-scrollbar {
+  display: none;
+}
+
+.image-preview-item {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  max-width: min(240px, 72vw);
+  min-height: 42px;
+  padding: 4px 30px 4px 5px;
+  border: 1px solid rgba(148, 163, 184, 0.34);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+}
+
+.image-preview-item img {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 9px;
+  object-fit: cover;
+  background: var(--bg-soft);
+}
+
+.image-preview-meta {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-preview-remove {
+  position: absolute;
+  top: 4px;
+  right: 5px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.07);
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 16px;
+  line-height: 20px;
+}
+
+.image-preview-remove:hover,
+.image-preview-remove:focus-visible {
+  background: var(--primary-soft);
+  color: var(--primary);
+  outline: none;
+}
+
 label {
   display: inline-block;
   margin-bottom: 8px;
@@ -1037,7 +1137,8 @@ label {
   line-height: 1.45;
 }
 
-.composer-more {
+.composer-more,
+.composer-attach {
   align-self: center;
 }
 
@@ -1119,6 +1220,7 @@ label {
 }
 
 .composer-more,
+.composer-attach,
 .composer-send {
   width: 34px;
   min-width: 34px;
@@ -1133,6 +1235,7 @@ label {
 }
 
 .composer-row .composer-more svg,
+.composer-row .composer-attach svg,
 .composer-row .composer-send svg {
   width: 18px;
   height: 18px;
@@ -2239,6 +2342,7 @@ textarea:focus-visible {
   }
 
   .composer-more,
+  .composer-attach,
   .composer-send {
     width: 34px;
     min-width: 34px;
@@ -2248,7 +2352,8 @@ textarea:focus-visible {
     box-shadow: none;
   }
 
-  .composer-more {
+  .composer-more,
+  .composer-attach {
     background: rgba(255, 255, 255, 0.96);
   }
 

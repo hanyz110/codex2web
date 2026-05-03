@@ -108,6 +108,7 @@
 
             <form id="composerForm" class="composer-form" novalidate>
               <label class="sr-only" for="composerInput">下一条指令</label>
+              <div id="imagePreviewList" class="image-preview-list" aria-label="待发送图片" hidden></div>
               <div class="composer-row">
                 <textarea
                   id="composerInput"
@@ -156,6 +157,25 @@
                       </button>
                     </div>
                   </div>
+                  <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+                  <button
+                    id="attachImageButton"
+                    class="icon-button composer-attach"
+                    type="button"
+                    aria-label="添加图片"
+                    aria-controls="imagePreviewList"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        d="M6 17.5 9.8 13a1.4 1.4 0 0 1 2.1 0l2.1 2.4 1.1-1.3a1.4 1.4 0 0 1 2.1 0l2.8 3.4M8.5 9.5h.01M6.8 4.5h10.4a2.3 2.3 0 0 1 2.3 2.3v10.4a2.3 2.3 0 0 1-2.3 2.3H6.8a2.3 2.3 0 0 1-2.3-2.3V6.8a2.3 2.3 0 0 1 2.3-2.3Z"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="1.8"
+                      />
+                    </svg>
+                  </button>
                   <button id="sendButton" class="btn-primary composer-send" type="button" aria-label="发送">
                     <svg class="action-icon-send" viewBox="0 0 24 24" aria-hidden="true">
                       <path
