@@ -11,6 +11,18 @@ const STOP_ESCALATION_TIMEOUT_MS = 3000;
 const STOP_STATUS_RESET_MS = 6000;
 const SESSION_POLL_INTERVAL_MS = 1200;
 const SESSION_REFRESH_TTL_MS = 5000;
+const EXECUTION_STALL_WATCHDOG_INTERVAL_MS = readPositiveDuration(
+  process.env.CODEX2WEB_STALL_WATCHDOG_INTERVAL_MS,
+  5000,
+);
+const EXECUTION_VISIBLE_OUTPUT_STALL_MS = readPositiveDuration(
+  process.env.CODEX2WEB_VISIBLE_OUTPUT_STALL_MS,
+  10 * 60 * 1000,
+);
+const EXECUTION_MAX_RUNTIME_MS = readPositiveDuration(
+  process.env.CODEX2WEB_MAX_EXECUTION_MS,
+  45 * 60 * 1000,
+);
 
 export class BridgeError extends Error {
   constructor(statusCode, message, code) {
@@ -23,6 +35,11 @@ export class BridgeError extends Error {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function readPositiveDuration(value, fallbackMs) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs;
 }
 
 function trimText(value) {
@@ -332,6 +349,14 @@ export class LocalSessionBridge {
     };
   }
 
+  getExecutionRuntimeConfig() {
+    return {
+      maxRuntimeMs: EXECUTION_MAX_RUNTIME_MS,
+      stallWatchdogIntervalMs: EXECUTION_STALL_WATCHDOG_INTERVAL_MS,
+      visibleOutputStallMs: EXECUTION_VISIBLE_OUTPUT_STALL_MS,
+    };
+  }
+
   #createDefaultExecutionState(sessionId) {
     return {
       acceptedAt: null,
@@ -339,6 +364,7 @@ export class LocalSessionBridge {
       lastActivityAt: null,
       lastVisibleMessageAt: null,
       phase: "idle",
+      pid: null,
       processAlive: false,
       sessionId: sessionId || null,
       startedAt: null,
@@ -435,6 +461,102 @@ export class LocalSessionBridge {
       time,
     });
     this.#emit("state", this.getBinding());
+  }
+
+  #clearRunTimers(runContext) {
+    if (!runContext) {
+      return;
+    }
+
+    for (const timerKey of ["stallWatchdogTimer", "stopEscalationTimer"]) {
+      if (runContext[timerKey]) {
+        clearTimeout(runContext[timerKey]);
+        runContext[timerKey] = null;
+      }
+    }
+  }
+
+  #finishRun(sessionId, runContext) {
+    this.#clearRunTimers(runContext);
+    this.#activeSendRuns.delete(sessionId);
+    this.#sendingSessionIds.delete(sessionId);
+  }
+
+  #requestRunStop(session, runContext, { auditAction = "execution_stop", detail, phase = "stopping" } = {}) {
+    if (!session?.id || !runContext?.child || runContext.child.exitCode != null) {
+      return false;
+    }
+
+    const message = trimText(detail) || "停止请求已发出，等待执行进程退出。";
+    runContext.stopRequested = true;
+    this.#setExecutionState(session.id, {
+      lastActivityAt: nowIso(),
+      phase,
+      processAlive: true,
+      statusDetail: message,
+    }, { emit: false });
+    this.#setStopStatus(session.id, "stopping", message);
+    this.#recordAudit({
+      action: auditAction,
+      detail: message,
+      nextSessionId: session.id,
+      prevSessionId: null,
+    });
+
+    const signaled = runContext.child.kill("SIGINT");
+    if (!signaled) {
+      runContext.stopRequested = false;
+      this.#setStopStatus(session.id, "stop-failed", "停止失败：无法向执行进程发送中断信号。");
+      return false;
+    }
+
+    if (runContext.stopEscalationTimer) {
+      clearTimeout(runContext.stopEscalationTimer);
+    }
+    runContext.stopEscalationTimer = setTimeout(() => {
+      if (runContext.child.exitCode == null) {
+        runContext.child.kill("SIGTERM");
+      }
+    }, STOP_ESCALATION_TIMEOUT_MS);
+    runContext.stopEscalationTimer.unref?.();
+    return true;
+  }
+
+  #startRunWatchdog(session, runContext) {
+    const check = () => {
+      if (!this.#activeSendRuns.has(session.id) || runContext.child.exitCode != null) {
+        this.#clearRunTimers(runContext);
+        return;
+      }
+
+      const now = Date.now();
+      const startedAtMs = Date.parse(runContext.startedAt);
+      const lastVisibleAtMs = Date.parse(runContext.lastVisibleMessageAt || runContext.acceptedAt || runContext.startedAt);
+      const runtimeMs = Number.isFinite(startedAtMs) ? now - startedAtMs : 0;
+      const quietVisibleMs = Number.isFinite(lastVisibleAtMs) ? now - lastVisibleAtMs : 0;
+
+      if (runtimeMs >= EXECUTION_MAX_RUNTIME_MS) {
+        this.#requestRunStop(session, runContext, {
+          auditAction: "execution_auto_stop_max_runtime",
+          detail: `执行已超过 ${Math.round(EXECUTION_MAX_RUNTIME_MS / 60000)} 分钟上限，已自动停止并释放发送锁。`,
+        });
+        return;
+      }
+
+      if (quietVisibleMs >= EXECUTION_VISIBLE_OUTPUT_STALL_MS) {
+        this.#requestRunStop(session, runContext, {
+          auditAction: "execution_auto_stop_no_visible_output",
+          detail: `执行已超过 ${Math.round(EXECUTION_VISIBLE_OUTPUT_STALL_MS / 60000)} 分钟没有新的可见输出，已自动停止并释放发送锁。`,
+        });
+        return;
+      }
+
+      runContext.stallWatchdogTimer = setTimeout(check, EXECUTION_STALL_WATCHDOG_INTERVAL_MS);
+      runContext.stallWatchdogTimer.unref?.();
+    };
+
+    runContext.stallWatchdogTimer = setTimeout(check, EXECUTION_STALL_WATCHDOG_INTERVAL_MS);
+    runContext.stallWatchdogTimer.unref?.();
   }
 
   setFailureMode(kind, enabled) {
@@ -681,32 +803,18 @@ export class LocalSessionBridge {
       };
     }
 
-    runContext.stopRequested = true;
-    this.#setExecutionState(session.id, {
-      lastActivityAt: nowIso(),
-      phase: "stopping",
-      processAlive: true,
-      statusDetail: "停止请求已发出，等待执行进程退出。",
-    }, { emit: false });
-    this.#setStopStatus(session.id, "stopping", "停止请求已发出，等待执行进程退出。");
-    const signaled = runContext.child.kill("SIGINT");
+    const signaled = this.#requestRunStop(session, runContext, {
+      auditAction: "execution_user_stop",
+      detail: "停止请求已发出，等待执行进程退出。",
+    });
 
     if (!signaled) {
-      runContext.stopRequested = false;
-      this.#setStopStatus(session.id, "stop-failed", "停止失败：无法向执行进程发送中断信号。");
       return {
         message: "停止失败：无法向执行进程发送中断信号。",
         sessionId: session.id,
         status: "stop-failed",
       };
     }
-
-    runContext.stopEscalationTimer = setTimeout(() => {
-      if (runContext.child.exitCode == null) {
-        runContext.child.kill("SIGTERM");
-      }
-    }, STOP_ESCALATION_TIMEOUT_MS);
-    runContext.stopEscalationTimer.unref?.();
 
     return {
       message: "停止请求已发出，等待执行进程退出。",
@@ -742,7 +850,11 @@ export class LocalSessionBridge {
         },
       );
       const runContext = {
+        acceptedAt: null,
         child,
+        lastVisibleMessageAt: null,
+        startedAt: nowIso(),
+        stallWatchdogTimer: null,
         stopEscalationTimer: null,
         stopRequested: false,
       };
@@ -750,10 +862,14 @@ export class LocalSessionBridge {
       this.#setExecutionState(session.id, {
         lastActivityAt: nowIso(),
         phase: "starting",
+        pid: child.pid || null,
         processAlive: true,
-        statusDetail: "Codex 执行进程已启动，等待确认接收。",
+        statusDetail: child.pid
+          ? `Codex 执行进程已启动（PID ${String(child.pid)}），等待确认接收。`
+          : "Codex 执行进程已启动，等待确认接收。",
       }, { emit: false });
       this.#emit("state", this.getBinding());
+      this.#startRunWatchdog(session, runContext);
 
       const accept = () => {
         if (accepted) {
@@ -761,10 +877,12 @@ export class LocalSessionBridge {
         }
 
         accepted = true;
+        runContext.acceptedAt = nowIso();
         this.#setExecutionState(session.id, {
-          acceptedAt: nowIso(),
+          acceptedAt: runContext.acceptedAt,
           lastActivityAt: nowIso(),
           phase: runContext.stopRequested ? "stopping" : "running",
+          pid: child.pid || null,
           processAlive: true,
           statusDetail: runContext.stopRequested
             ? "停止请求已发出，等待执行进程退出。"
@@ -797,6 +915,7 @@ export class LocalSessionBridge {
         this.#setExecutionState(session.id, {
           lastActivityAt: nowIso(),
           phase: "failed",
+          pid: child.pid || null,
           processAlive: false,
           statusDetail: message,
         }, { emit: false });
@@ -810,6 +929,7 @@ export class LocalSessionBridge {
 
       child.on("error", (error) => {
         clearTimeout(timeoutId);
+        this.#finishRun(session.id, runContext);
         fail(`Send transport failed to start: ${String(error.message || error)}`);
       });
 
@@ -819,6 +939,7 @@ export class LocalSessionBridge {
         this.#setExecutionState(session.id, {
           lastActivityAt: activityAt,
           phase: accepted ? (runContext.stopRequested ? "stopping" : "running") : "starting",
+          pid: child.pid || null,
           processAlive: true,
           statusDetail: runContext.stopRequested
             ? "停止请求已发出，等待执行进程退出。"
@@ -841,6 +962,7 @@ export class LocalSessionBridge {
         this.#setExecutionState(session.id, {
           lastActivityAt: nowIso(),
           phase: accepted ? (runContext.stopRequested ? "stopping" : "running") : "starting",
+          pid: child.pid || null,
           processAlive: true,
           statusDetail: runContext.stopRequested
             ? "停止请求已发出，等待执行进程退出。"
@@ -852,12 +974,7 @@ export class LocalSessionBridge {
 
       child.on("close", (code) => {
         clearTimeout(timeoutId);
-        if (runContext.stopEscalationTimer) {
-          clearTimeout(runContext.stopEscalationTimer);
-          runContext.stopEscalationTimer = null;
-        }
-        this.#activeSendRuns.delete(session.id);
-        this.#sendingSessionIds.delete(session.id);
+        this.#finishRun(session.id, runContext);
         const stopStatus = this.#getStopStatus(session.id);
         const stopInProgress = runContext.stopRequested || stopStatus.status === "stopping";
 
@@ -870,6 +987,7 @@ export class LocalSessionBridge {
             exitCode: code,
             lastActivityAt: nowIso(),
             phase: "idle",
+            pid: child.pid || null,
             processAlive: false,
             statusDetail: `${detail} 可继续发送。`,
           }, { emit: false });
@@ -887,6 +1005,7 @@ export class LocalSessionBridge {
             exitCode: 0,
             lastActivityAt: nowIso(),
             phase: "idle",
+            pid: child.pid || null,
             processAlive: false,
             statusDetail: "当前执行已完成，可继续发送下一条指令。",
           }, { emit: false });
@@ -1022,9 +1141,14 @@ export class LocalSessionBridge {
       }
       const executionState = this.#executionStateBySession.get(session.id);
       if (executionState && (executionState.phase === "starting" || executionState.phase === "running")) {
+        const visibleAt = entry.time || nowIso();
+        const runContext = this.#activeSendRuns.get(session.id);
+        if (runContext) {
+          runContext.lastVisibleMessageAt = visibleAt;
+        }
         this.#setExecutionState(session.id, {
-          lastActivityAt: entry.time || nowIso(),
-          lastVisibleMessageAt: entry.time || nowIso(),
+          lastActivityAt: visibleAt,
+          lastVisibleMessageAt: visibleAt,
           phase: "running",
           processAlive: true,
           statusDetail: "执行中，已收到新的可见输出。",

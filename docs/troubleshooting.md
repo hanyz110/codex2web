@@ -51,6 +51,29 @@ Typical causes:
 2. session attach failed
 3. a previous execution is still running or stopping
 
+## Message sent but the session appears stuck
+
+Codex2Web tracks the child `codex exec resume` process for each sent prompt.
+
+The UI will first show slow-start or quiet-execution hints. If the child process stays alive but no visible transcript message arrives for too long, the bridge now stops that child process and releases the send lock automatically.
+
+Default runtime guards:
+
+1. `CODEX2WEB_VISIBLE_OUTPUT_STALL_MS`: `600000` milliseconds, 10 minutes without visible output
+2. `CODEX2WEB_MAX_EXECUTION_MS`: `2700000` milliseconds, 45 minutes total runtime
+3. `CODEX2WEB_STALL_WATCHDOG_INTERVAL_MS`: `5000` milliseconds
+
+Useful checks:
+
+```bash
+curl -u '<user>:<pass>' http://127.0.0.1:4422/api/system/meta
+curl -u '<user>:<pass>' http://127.0.0.1:4422/api/session/binding
+ps -axo pid,ppid,etime,stat,command | rg 'codex exec resume|dev-server|cloudflared'
+tail -30 .codex2web/session-audit.jsonl
+```
+
+If the page is still open on `127.0.0.1:4321` but the external service is actually on `4422`, reload the correct URL. A dead `4321` page can look like a stuck session even when the external service is healthy.
+
 ## Stop does not work
 
 1. confirm the UI is currently in `sending` state

@@ -313,6 +313,7 @@ async function handleApi(req, res, parsedUrl) {
     if (method === "GET" && pathname === "/api/system/meta") {
       sendJson(res, 200, {
         execution: bridge.getExecutionPolicy(),
+        executionRuntime: bridge.getExecutionRuntimeConfig(),
         externalMode: requiresExternalAuthBoundary,
         host,
         ok: true,
