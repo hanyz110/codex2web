@@ -1,11 +1,18 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { appendFile, mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const DEFAULT_CODEX_BINARY = path.join(os.homedir(), ".bun", "bin", "codex");
+const CODEX_BINARY_CANDIDATES = [
+  "/Applications/Codex.app/Contents/Resources/codex",
+  path.join(os.homedir(), ".nvm", "versions", "node", "v22.20.0", "bin", "codex"),
+  path.join(os.homedir(), ".bun", "bin", "codex"),
+];
 const DEFAULT_TRANSCRIPT_LIMIT = 300;
+const FIRST_JSONL_RECORD_READ_BYTES = 64 * 1024;
+const MAX_TRANSPORT_ERROR_DETAIL_CHARS = 1200;
 const SEND_ACCEPT_TIMEOUT_MS = 1500;
 const STOP_ESCALATION_TIMEOUT_MS = 3000;
 const STOP_STATUS_RESET_MS = 6000;
@@ -53,6 +60,83 @@ function normalizePath(value) {
   }
 
   return trimmed.length > 1 ? trimmed.replace(/\/+$/, "") : trimmed;
+}
+
+function parseCodexVersion(output) {
+  const match = String(output || "").match(/(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?/);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] || "",
+    raw: match[0],
+  };
+}
+
+function compareCodexVersions(left, right) {
+  if (!left && !right) {
+    return 0;
+  }
+  if (!left) {
+    return -1;
+  }
+  if (!right) {
+    return 1;
+  }
+
+  for (const key of ["major", "minor", "patch"]) {
+    if (left[key] !== right[key]) {
+      return left[key] - right[key];
+    }
+  }
+
+  if (left.prerelease === right.prerelease) {
+    return 0;
+  }
+  if (!left.prerelease) {
+    return 1;
+  }
+  if (!right.prerelease) {
+    return -1;
+  }
+  return left.prerelease.localeCompare(right.prerelease);
+}
+
+function getCodexBinaryVersion(binaryPath) {
+  if (!binaryPath || !existsSync(binaryPath)) {
+    return null;
+  }
+
+  const result = spawnSync(binaryPath, ["--version"], {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 3000,
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+
+  return parseCodexVersion(`${result.stdout || ""}\n${result.stderr || ""}`);
+}
+
+function resolveDefaultCodexBinary() {
+  let selected = null;
+  for (const candidate of CODEX_BINARY_CANDIDATES) {
+    const version = getCodexBinaryVersion(candidate);
+    if (!version) {
+      continue;
+    }
+
+    if (!selected || compareCodexVersions(version, selected.version) > 0) {
+      selected = { path: candidate, version };
+    }
+  }
+
+  return selected?.path || path.join(os.homedir(), ".bun", "bin", "codex");
 }
 
 function safeJsonParse(line) {
@@ -163,9 +247,23 @@ async function listJsonlFiles(rootPath) {
 }
 
 async function readFirstJsonlRecord(filePath) {
-  const raw = await readFile(filePath, "utf-8");
+  const raw = await readJsonlSlice(filePath, 0, FIRST_JSONL_RECORD_READ_BYTES);
   const firstLine = raw.split("\n").find((line) => line.trim().length > 0);
   return firstLine ? safeJsonParse(firstLine) : null;
+}
+
+function formatTransportExitMessage(code, stderrText) {
+  const detail = trimText(stderrText)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-8)
+    .join("\n")
+    .slice(0, MAX_TRANSPORT_ERROR_DETAIL_CHARS);
+
+  return detail
+    ? `Send transport exited with code ${String(code)}. ${detail}`
+    : `Send transport exited with code ${String(code)}.`;
 }
 
 async function readJsonlSlice(filePath, offset, length) {
@@ -276,6 +374,7 @@ export class LocalSessionBridge {
   #stopStatusResetTimers = new Map();
   #sessionCursors = new Map();
   #sessionIndexPath;
+  #sessionFileInfoCache = new Map();
   #sessionRootPath;
   #sessions = [];
   #sessionsById = new Map();
@@ -284,7 +383,7 @@ export class LocalSessionBridge {
 
   constructor({ auditFilePath, codexBinaryPath, executionPolicy, projectPath, stateFilePath }) {
     this.#auditFilePath = auditFilePath;
-    this.#codexBinaryPath = normalizePath(codexBinaryPath) || DEFAULT_CODEX_BINARY;
+    this.#codexBinaryPath = normalizePath(codexBinaryPath) || resolveDefaultCodexBinary();
     this.#executionPolicy = {
       cliArgs: Array.isArray(executionPolicy?.cliArgs) ? executionPolicy.cliArgs.slice() : [],
       displayName: trimText(executionPolicy?.displayName) || "Implicit Default",
@@ -623,10 +722,48 @@ export class LocalSessionBridge {
       return [];
     }
 
+    const cachedTranscript = this.#transcriptCache.get(sessionId);
+    const cachedCursor = this.#sessionCursors.get(sessionId);
+    const cachedFileInfo = this.#sessionFileInfoCache.get(sessionId);
+    if (cachedTranscript && cachedCursor && cachedFileInfo) {
+      try {
+        const fileInfo = await stat(session.filePath);
+        if (
+          fileInfo.size === cachedFileInfo.size &&
+          fileInfo.mtimeMs === cachedFileInfo.mtimeMs
+        ) {
+          return cachedTranscript.map((entry) => ({ ...entry }));
+        }
+      } catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+          throw error;
+        }
+      }
+    }
+
     const { cursor, transcript } = await parseTranscriptFile(session);
     this.#sessionCursors.set(sessionId, cursor);
     this.#transcriptCache.set(sessionId, transcript);
+    const fileInfo = await stat(session.filePath);
+    this.#sessionFileInfoCache.set(sessionId, {
+      mtimeMs: fileInfo.mtimeMs,
+      size: fileInfo.size,
+    });
     return transcript.map((entry) => ({ ...entry }));
+  }
+
+  async refreshTranscriptCache(sessionId = this.#pinnedSessionId) {
+    if (!sessionId) {
+      return [];
+    }
+
+    await this.#pollSessionById(sessionId);
+    const transcript = this.#transcriptCache.get(sessionId);
+    if (transcript) {
+      return transcript.map((entry) => ({ ...entry }));
+    }
+
+    return this.getTranscript(sessionId);
   }
 
   async getTranscriptSnapshot({ afterId = "", sessionId = this.#pinnedSessionId } = {}) {
@@ -648,10 +785,7 @@ export class LocalSessionBridge {
       };
     }
 
-    let transcript = this.#transcriptCache.get(sessionId);
-    if (!transcript) {
-      transcript = await this.getTranscript(sessionId);
-    }
+    let transcript = await this.refreshTranscriptCache(sessionId);
 
     const latestEntryId = transcript.at(-1)?.id || null;
     if (!afterId) {
@@ -696,7 +830,7 @@ export class LocalSessionBridge {
     const previousPinnedSessionId = this.#pinnedSessionId;
     this.#pinnedSessionId = target.id;
     await this.#persistPinnedSessionId();
-    await this.getTranscript(target.id);
+    await this.refreshTranscriptCache(target.id);
     this.#recordAudit({
       action: "session_switch",
       detail: "User explicitly switched the pinned local Codex session.",
@@ -734,6 +868,14 @@ export class LocalSessionBridge {
     const session = this.#getSession(this.#pinnedSessionId);
     if (this.#failureModes.attach || !session) {
       throw new BridgeError(409, "Pinned session is not attached.", "SESSION_ATTACH_ERROR");
+    }
+
+    if (!existsSync(session.filePath)) {
+      throw new BridgeError(
+        409,
+        "当前 pinned session 对应的本地会话文件不存在，无法继续在原会话上发送。请切换到最近仍可用的 session 后重试。",
+        "SESSION_FILE_MISSING",
+      );
     }
 
     if (this.#sendingSessionIds.has(session.id)) {
@@ -834,6 +976,7 @@ export class LocalSessionBridge {
   async #startResumeProcess(session, prompt, { imagePaths = [] } = {}) {
     let accepted = false;
     let timeoutId = null;
+    let stderrText = "";
 
     return new Promise((resolve, reject) => {
       const imageArgs = imagePaths.flatMap((filePath) => ["--image", filePath]);
@@ -970,6 +1113,8 @@ export class LocalSessionBridge {
       });
 
       child.stderr.on("data", (chunk) => {
+        const text = chunk.toString("utf-8");
+        stderrText = `${stderrText}${text}`.slice(-MAX_TRANSPORT_ERROR_DETAIL_CHARS * 2);
         this.#setExecutionState(session.id, {
           lastActivityAt: nowIso(),
           phase: accepted ? (runContext.stopRequested ? "stopping" : "running") : "starting",
@@ -1027,7 +1172,7 @@ export class LocalSessionBridge {
           return;
         }
 
-        fail(`Send transport exited with code ${String(code)}.`);
+        fail(formatTransportExitMessage(code, stderrText));
       });
 
       child.stdin.write(prompt);
@@ -1088,7 +1233,11 @@ export class LocalSessionBridge {
   }
 
   async #pollPinnedSession() {
-    const session = this.#getSession(this.#pinnedSessionId);
+    await this.#pollSessionById(this.#pinnedSessionId);
+  }
+
+  async #pollSessionById(sessionId) {
+    const session = this.#getSession(sessionId);
     if (!session) {
       return;
     }
@@ -1117,7 +1266,13 @@ export class LocalSessionBridge {
       return;
     }
 
-    if (fileInfo.size === cursor.offset) {
+    const previousFileInfo = this.#sessionFileInfoCache.get(session.id);
+    this.#sessionFileInfoCache.set(session.id, {
+      mtimeMs: fileInfo.mtimeMs,
+      size: fileInfo.size,
+    });
+
+    if (fileInfo.size === cursor.offset && previousFileInfo?.mtimeMs === fileInfo.mtimeMs) {
       return;
     }
 

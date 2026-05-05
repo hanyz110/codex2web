@@ -359,7 +359,6 @@ async function handleApi(req, res, parsedUrl) {
         binding,
         failureModes: bridge.getFailureModes(),
         ok: true,
-        transcript: await bridge.getTranscript(binding.pinnedSessionId),
       });
       return;
     }
@@ -410,7 +409,6 @@ async function handleApi(req, res, parsedUrl) {
       sendJson(res, 200, {
         binding,
         ok: true,
-        transcript: await bridge.getTranscript(binding.pinnedSessionId),
       });
       return;
     }
@@ -464,7 +462,7 @@ async function handleApi(req, res, parsedUrl) {
       writeBridgeState(res);
 
       const binding = bridge.getBinding();
-      for (const entry of await bridge.getTranscript(binding.pinnedSessionId)) {
+      for (const entry of await bridge.refreshTranscriptCache(binding.pinnedSessionId)) {
         sendSseEvent(res, "message", { entry, replay: true, sessionId: binding.pinnedSessionId });
       }
 

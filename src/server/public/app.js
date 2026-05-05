@@ -2280,9 +2280,10 @@ async function loadInitialState() {
   updateBinding(requireBinding(payload.binding, "初始化"));
   state.failureModes = payload.failureModes || state.failureModes;
   state.auditTrail = payload.auditTrail || [];
-  replaceTranscript(payload.transcript || []);
+  replaceTranscript([]);
   renderAuditTrail();
   renderState();
+  await syncBindingSnapshot({ silent: true });
 }
 
 async function setFailure(kind, enabled) {
@@ -2484,10 +2485,11 @@ async function attachSessionById(sessionId, switchButton, sessionLabel) {
     });
 
     updateBinding(requireBinding(attachPayload.binding, "切换会话"));
-    replaceTranscript(attachPayload.transcript || []);
+    replaceTranscript([]);
     await loadSessions();
     await loadAuditTrail();
     renderState();
+    await syncBindingSnapshot({ silent: true });
     setAlert("");
     jumpToChatView();
   } catch (error) {
