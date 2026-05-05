@@ -2142,16 +2142,33 @@ function refreshSnapshotPoller() {
   }, nextPollMs);
 }
 
-async function syncBindingSnapshot({ silent = false } = {}) {
-  if (snapshotPollInFlight) {
+async function syncBindingSnapshot({
+  expectedSessionId = state.pinnedSessionId,
+  forceFull = false,
+  silent = false,
+} = {}) {
+  if (snapshotPollInFlight && !forceFull) {
     return;
   }
 
+  const requestSessionId = expectedSessionId || state.pinnedSessionId || "";
   snapshotPollInFlight = true;
   try {
-    const afterId = encodeURIComponent(getLatestTranscriptId());
-    const payload = await requestJson(`/api/session/snapshot?after=${afterId}&_ts=${Date.now()}`);
-    updateBinding(requireBinding(payload.binding, "快照同步"));
+    const latestTranscriptId = forceFull ? "" : getLatestTranscriptId();
+    const afterId = encodeURIComponent(latestTranscriptId);
+    const forceParam = forceFull ? "&force=full" : "";
+    const payload = await requestJson(`/api/session/snapshot?after=${afterId}${forceParam}&_ts=${Date.now()}`);
+    const nextBinding = requireBinding(payload.binding, "快照同步");
+    const payloadSessionId = nextBinding.pinnedSessionId || "";
+    if (
+      requestSessionId &&
+      ((state.pinnedSessionId && state.pinnedSessionId !== requestSessionId) ||
+        (payloadSessionId && payloadSessionId !== requestSessionId))
+    ) {
+      return;
+    }
+
+    updateBinding(nextBinding);
     state.failureModes = payload.failureModes || state.failureModes;
     markTransportActivity();
 
@@ -2283,7 +2300,7 @@ async function loadInitialState() {
   replaceTranscript([]);
   renderAuditTrail();
   renderState();
-  await syncBindingSnapshot({ silent: true });
+  await syncBindingSnapshot({ forceFull: true, silent: true });
 }
 
 async function setFailure(kind, enabled) {
@@ -2486,10 +2503,14 @@ async function attachSessionById(sessionId, switchButton, sessionLabel) {
 
     updateBinding(requireBinding(attachPayload.binding, "切换会话"));
     replaceTranscript([]);
-    await loadSessions();
-    await loadAuditTrail();
     renderState();
-    await syncBindingSnapshot({ silent: true });
+    void loadSessions().catch(() => {});
+    void loadAuditTrail().catch(() => {});
+    await syncBindingSnapshot({
+      expectedSessionId: attachPayload.binding.pinnedSessionId,
+      forceFull: true,
+      silent: true,
+    });
     setAlert("");
     jumpToChatView();
   } catch (error) {

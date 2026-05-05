@@ -366,11 +366,12 @@ async function handleApi(req, res, parsedUrl) {
     if (method === "GET" && pathname === "/api/session/snapshot") {
       await bridge.discoverSessions();
       const afterId = String(parsedUrl.searchParams.get("after") || "");
+      const forceFull = String(parsedUrl.searchParams.get("force") || "").toLowerCase() === "full";
       sendJson(res, 200, {
         binding: bridge.getBinding(),
         failureModes: bridge.getFailureModes(),
         ok: true,
-        snapshot: await bridge.getTranscriptSnapshot({ afterId }),
+        snapshot: await bridge.getTranscriptSnapshot({ afterId, forceFull }),
       });
       return;
     }

@@ -12,6 +12,8 @@ const CODEX_BINARY_CANDIDATES = [
 ];
 const DEFAULT_TRANSCRIPT_LIMIT = 300;
 const FIRST_JSONL_RECORD_READ_BYTES = 64 * 1024;
+const TRANSCRIPT_TAIL_INITIAL_READ_BYTES = 512 * 1024;
+const TRANSCRIPT_TAIL_MAX_READ_BYTES = 24 * 1024 * 1024;
 const MAX_TRANSPORT_ERROR_DETAIL_CHARS = 1200;
 const SEND_ACCEPT_TIMEOUT_MS = 1500;
 const STOP_ESCALATION_TIMEOUT_MS = 3000;
@@ -267,6 +269,10 @@ function formatTransportExitMessage(code, stderrText) {
 }
 
 async function readJsonlSlice(filePath, offset, length) {
+  if (length <= 0) {
+    return "";
+  }
+
   const handle = await open(filePath, "r");
   try {
     const buffer = Buffer.alloc(length);
@@ -275,6 +281,28 @@ async function readJsonlSlice(filePath, offset, length) {
   } finally {
     await handle.close();
   }
+}
+
+async function readTranscriptTail(filePath, fileSize) {
+  const maxReadBytes = Math.min(fileSize, TRANSCRIPT_TAIL_MAX_READ_BYTES);
+  let readBytes = Math.min(fileSize, TRANSCRIPT_TAIL_INITIAL_READ_BYTES);
+
+  while (readBytes <= maxReadBytes) {
+    const offset = Math.max(0, fileSize - readBytes);
+    const raw = await readJsonlSlice(filePath, offset, fileSize - offset);
+    const lines = raw.split("\n").filter((line) => line.trim());
+    if (
+      offset === 0 ||
+      lines.length >= DEFAULT_TRANSCRIPT_LIMIT * 3 ||
+      readBytes >= maxReadBytes
+    ) {
+      return { offset, raw };
+    }
+
+    readBytes = Math.min(maxReadBytes, readBytes * 2);
+  }
+
+  return { offset: 0, raw: "" };
 }
 
 async function loadSessionIndex(indexPath) {
@@ -310,11 +338,19 @@ async function loadSessionIndex(indexPath) {
 }
 
 async function parseTranscriptFile(session) {
-  const raw = await readFile(session.filePath, "utf-8");
+  const fileInfo = await stat(session.filePath);
+  const { offset, raw } = await readTranscriptTail(session.filePath, fileInfo.size);
   const records = [];
-  let lineNumber = 0;
+  const startsAtBeginning = offset === 0;
+  let lineNumber = startsAtBeginning ? 0 : offset;
+  let skippedPartialLine = false;
 
   for (const line of raw.split("\n")) {
+    if (!startsAtBeginning && !skippedPartialLine) {
+      skippedPartialLine = true;
+      continue;
+    }
+
     if (!line.trim()) {
       continue;
     }
@@ -339,7 +375,6 @@ async function parseTranscriptFile(session) {
   }
 
   const trimmed = transcript.slice(-DEFAULT_TRANSCRIPT_LIMIT);
-  const fileInfo = await stat(session.filePath);
   return {
     cursor: {
       emittedIds: new Set(trimmed.map((entry) => entry.id)),
@@ -406,7 +441,6 @@ export class LocalSessionBridge {
 
     if (this.#pinnedSessionId) {
       await this.#persistPinnedSessionId();
-      await this.getTranscript(this.#pinnedSessionId);
       this.#recordAudit({
         action: "session_restore",
         detail: hasPersistedPin
@@ -766,7 +800,7 @@ export class LocalSessionBridge {
     return this.getTranscript(sessionId);
   }
 
-  async getTranscriptSnapshot({ afterId = "", sessionId = this.#pinnedSessionId } = {}) {
+  async getTranscriptSnapshot({ afterId = "", forceFull = false, sessionId = this.#pinnedSessionId } = {}) {
     if (!sessionId) {
       return {
         entries: [],
@@ -788,11 +822,11 @@ export class LocalSessionBridge {
     let transcript = await this.refreshTranscriptCache(sessionId);
 
     const latestEntryId = transcript.at(-1)?.id || null;
-    if (!afterId) {
+    if (forceFull || !afterId) {
       return {
         entries: transcript.map((entry) => ({ ...entry })),
         latestEntryId,
-        reset: false,
+        reset: true,
       };
     }
 
@@ -830,7 +864,6 @@ export class LocalSessionBridge {
     const previousPinnedSessionId = this.#pinnedSessionId;
     this.#pinnedSessionId = target.id;
     await this.#persistPinnedSessionId();
-    await this.refreshTranscriptCache(target.id);
     this.#recordAudit({
       action: "session_switch",
       detail: "User explicitly switched the pinned local Codex session.",
