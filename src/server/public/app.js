@@ -100,6 +100,7 @@ const badgeElements = {
 const seenMessageIds = new Set();
 const optimisticMessageIds = new Set();
 const expandedProjectPaths = new Set();
+const messageCopyResetTimers = new Map();
 let stream = null;
 let hadStreamError = false;
 let lastTransportActivityAt = 0;
@@ -111,12 +112,15 @@ let transportWatchdogTimer = null;
 let sessionsLoaded = false;
 let sessionsLoadingPromise = null;
 let favoriteSessions = new Map();
+let lastMessageCopyTap = { at: 0, messageId: "" };
 const COMPOSER_MIN_HEIGHT = 38;
 const DRAWER_CLOSE_TRANSITION_MS = 240;
 const MIN_OPERATION_LOADING_MS = 300;
 const FAVORITE_STORAGE_KEY = "codex2web.sessionFavorites.v1";
 const REQUEST_TIMEOUT_MS = 12000;
 const BOOT_LOADING_MAX_MS = 15000;
+const MESSAGE_COPY_DOUBLE_TAP_MS = 520;
+const MESSAGE_COPY_FEEDBACK_MS = 1300;
 const ALERT_AUTO_HIDE_BASE_MS = 3200;
 const ALERT_AUTO_HIDE_ERROR_MS = 5600;
 const EXTERNAL_IDLE_SNAPSHOT_POLL_MS = 2500;
@@ -1343,6 +1347,88 @@ async function copyTextToClipboard(text) {
   return copied;
 }
 
+function findTranscriptEntryById(messageId) {
+  return state.transcript.find((entry) => entry.id === messageId) || null;
+}
+
+function showMessageCopyFeedback(messageElement) {
+  if (!(messageElement instanceof HTMLElement)) {
+    return;
+  }
+
+  const messageId = messageElement.dataset.messageId || "";
+  const bodyElement = messageElement.querySelector(".message-body");
+  messageElement.classList.add("is-copied");
+  if (bodyElement instanceof HTMLElement) {
+    bodyElement.dataset.copyHint = "已复制";
+  }
+
+  const previousTimer = messageCopyResetTimers.get(messageId);
+  if (previousTimer) {
+    window.clearTimeout(previousTimer);
+  }
+
+  const nextTimer = window.setTimeout(() => {
+    messageElement.classList.remove("is-copied");
+    if (bodyElement instanceof HTMLElement) {
+      delete bodyElement.dataset.copyHint;
+    }
+    messageCopyResetTimers.delete(messageId);
+  }, MESSAGE_COPY_FEEDBACK_MS);
+  messageCopyResetTimers.set(messageId, nextTimer);
+}
+
+async function copySingleAssistantMessage(messageElement) {
+  const messageId = messageElement?.dataset?.messageId || "";
+  const entry = findTranscriptEntryById(messageId);
+  if (!entry || entry.role !== "assistant" || entry.pending) {
+    return;
+  }
+
+  const copied = await copyTextToClipboard(entry.text || "");
+  if (!copied) {
+    setAlert("复制失败，请手动选择这条回复后复制。");
+    return;
+  }
+
+  setAlert("");
+  showMessageCopyFeedback(messageElement);
+}
+
+async function maybeCopyAssistantMessageFromTap(target, event) {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+
+  if (target.closest("button, a, input, textarea, select, .code-copy-button")) {
+    lastMessageCopyTap = { at: 0, messageId: "" };
+    return false;
+  }
+
+  const messageElement = target.closest(".message.assistant");
+  if (!(messageElement instanceof HTMLElement) || !transcriptList?.contains(messageElement)) {
+    lastMessageCopyTap = { at: 0, messageId: "" };
+    return false;
+  }
+
+  const messageId = messageElement.dataset.messageId || "";
+  const now = Date.now();
+  const isDoubleTap =
+    messageId &&
+    lastMessageCopyTap.messageId === messageId &&
+    now - lastMessageCopyTap.at <= MESSAGE_COPY_DOUBLE_TAP_MS;
+
+  lastMessageCopyTap = { at: now, messageId };
+  if (!isDoubleTap) {
+    return false;
+  }
+
+  event.preventDefault();
+  await copySingleAssistantMessage(messageElement);
+  lastMessageCopyTap = { at: 0, messageId: "" };
+  return true;
+}
+
 function autoResizeComposer() {
   const viewportHeight = window.visualViewport?.height || window.innerHeight || 800;
   const composerMaxHeight = Math.max(168, Math.min(420, Math.floor(viewportHeight * 0.45)));
@@ -1409,6 +1495,7 @@ function renderTranscript() {
   for (const entry of state.transcript) {
     const item = document.createElement("li");
     item.className = `message ${entry.role}`;
+    item.dataset.messageId = entry.id || "";
     if (entry.pending) {
       item.classList.add("is-pending");
     }
@@ -1432,6 +1519,10 @@ function renderTranscript() {
 
     const body = document.createElement("div");
     body.className = "message-body";
+    body.setAttribute(
+      "title",
+      entry.role === "assistant" ? "连续双击复制这条回复" : "只支持复制单条 Codex 回复",
+    );
     body.innerHTML = renderMessageHtml(entry.text);
 
     meta.append(label, time);
@@ -2345,6 +2436,10 @@ transcriptList?.addEventListener("scroll", () => {
 transcriptList?.addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof Element)) {
+    return;
+  }
+
+  if (await maybeCopyAssistantMessageFromTap(target, event)) {
     return;
   }
 

@@ -602,6 +602,25 @@ h3 {
   background: transparent;
 }
 
+.message.assistant .message-body {
+  cursor: copy;
+}
+
+.message.assistant.is-copied {
+  background: linear-gradient(90deg, rgba(219, 234, 254, 0.5), transparent 46%);
+}
+
+.message.assistant.is-copied .message-body::after {
+  content: attr(data-copy-hint);
+  display: inline-flex;
+  margin-left: 8px;
+  transform: translateY(-1px);
+  color: #1d4ed8;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
 .message.user {
   padding-left: 8px;
   border-left: 2px solid rgba(37, 99, 235, 0.45);
