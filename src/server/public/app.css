@@ -769,11 +769,55 @@ h3 {
   border-left: none;
 }
 
+.message.assistant .message-body {
+  cursor: copy;
+}
+
+.message.assistant.is-copied {
+  background: linear-gradient(90deg, rgba(219, 234, 254, 0.5), transparent 46%);
+}
+
+.message.assistant.is-copied .message-body::after {
+  content: attr(data-copy-hint);
+  display: inline-flex;
+  margin-left: 8px;
+  transform: translateY(-1px);
+  color: #1d4ed8;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
 .message.user .message-body {
   background: transparent;
   border-color: transparent;
   border-left: none;
   color: var(--text);
+}
+
+.message.is-pending {
+  animation: pending-message-in 160ms ease-out;
+}
+
+.message.is-pending .message-content {
+  opacity: 0.72;
+}
+
+.message.is-pending .timestamp {
+  color: var(--primary);
+  font-weight: 650;
+}
+
+@keyframes pending-message-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .message-body > :first-child {
@@ -1003,6 +1047,81 @@ h3 {
   box-shadow: var(--ring);
 }
 
+.image-preview-list {
+  display: flex;
+  gap: 8px;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 1px 1px 3px;
+  scrollbar-width: none;
+}
+
+.image-preview-list[hidden] {
+  display: none;
+}
+
+.image-preview-list::-webkit-scrollbar {
+  display: none;
+}
+
+.image-preview-item {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  max-width: min(240px, 72vw);
+  min-height: 42px;
+  padding: 4px 30px 4px 5px;
+  border: 1px solid rgba(148, 163, 184, 0.34);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+}
+
+.image-preview-item img {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 9px;
+  object-fit: cover;
+  background: var(--bg-soft);
+}
+
+.image-preview-meta {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-preview-remove {
+  position: absolute;
+  top: 4px;
+  right: 5px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.07);
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 16px;
+  line-height: 20px;
+}
+
+.image-preview-remove:hover,
+.image-preview-remove:focus-visible {
+  background: var(--primary-soft);
+  color: var(--primary);
+  outline: none;
+}
+
 label {
   display: inline-block;
   margin-bottom: 8px;
@@ -1037,7 +1156,8 @@ label {
   line-height: 1.45;
 }
 
-.composer-more {
+.composer-more,
+.composer-attach {
   align-self: center;
 }
 
@@ -1052,8 +1172,9 @@ label {
   right: 0;
   bottom: calc(100% + 8px);
   z-index: 26;
-  width: max-content;
-  min-width: 156px;
+  box-sizing: border-box;
+  width: 306px;
+  max-width: calc(100vw - 28px);
   padding: 6px;
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -1078,7 +1199,20 @@ label {
   display: none;
 }
 
-.quick-command-item {
+.quick-command-panel[hidden] {
+  display: none;
+}
+
+.quick-command-panel {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.quick-command-item,
+.quick-command-back,
+.model-option-item {
+  box-sizing: border-box;
   width: 100%;
   min-height: 34px;
   padding: 0 10px;
@@ -1090,14 +1224,47 @@ label {
   font: inherit;
   font-size: 13px;
   font-weight: 650;
+  overflow: hidden;
   text-align: left;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .quick-command-item:hover,
-.quick-command-item:focus-visible {
+.quick-command-item:focus-visible,
+.quick-command-back:hover,
+.quick-command-back:focus-visible,
+.model-option-item:hover,
+.model-option-item:focus-visible {
   background: var(--bg-soft);
   outline: none;
+}
+
+.quick-command-back {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.model-option-list {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  min-width: 0;
+  max-height: min(320px, 48vh);
+  overflow: auto;
+}
+
+.model-option-item.is-current {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.model-option-empty {
+  margin: 0;
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .composer-send {
@@ -1119,6 +1286,7 @@ label {
 }
 
 .composer-more,
+.composer-attach,
 .composer-send {
   width: 34px;
   min-width: 34px;
@@ -1133,6 +1301,7 @@ label {
 }
 
 .composer-row .composer-more svg,
+.composer-row .composer-attach svg,
 .composer-row .composer-send svg {
   width: 18px;
   height: 18px;
@@ -1312,7 +1481,18 @@ textarea:focus-visible {
   inset: 0;
   background: rgba(15, 23, 42, 0.3);
   backdrop-filter: blur(2px);
+  opacity: 0;
+  transition: opacity 220ms ease;
   z-index: 20;
+}
+
+.drawer-backdrop.is-open {
+  opacity: 1;
+}
+
+.drawer-backdrop.is-dragging {
+  opacity: var(--drawer-drag-opacity, 0);
+  transition: none;
 }
 
 .session-drawer {
@@ -1329,12 +1509,19 @@ textarea:focus-visible {
   flex-direction: column;
   overflow: hidden;
   transform: translateX(100%);
+  will-change: transform;
   transition: transform 220ms ease;
+  touch-action: pan-y;
   z-index: 30;
 }
 
 .session-drawer.is-open {
   transform: translateX(0);
+}
+
+.session-drawer.is-dragging {
+  transform: translateX(var(--drawer-drag-x, 100%));
+  transition: none;
 }
 
 .drawer-head {
@@ -2101,10 +2288,10 @@ textarea:focus-visible {
   }
 
   .quick-command-menu {
+    left: auto;
     right: 0;
-    width: min(224px, calc(100vw - 28px));
-    min-width: min(184px, calc(100vw - 28px));
-    max-width: calc(100vw - 28px);
+    width: 272px;
+    max-width: calc(100vw - 48px);
     border-radius: 16px;
   }
 
@@ -2115,6 +2302,16 @@ textarea:focus-visible {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .quick-command-back,
+  .model-option-item {
+    min-height: 38px;
+    max-width: 100%;
+  }
+
+  .model-option-list {
+    width: 100%;
   }
 
   .flow-status-copy {
@@ -2221,6 +2418,7 @@ textarea:focus-visible {
   }
 
   .composer-more,
+  .composer-attach,
   .composer-send {
     width: 34px;
     min-width: 34px;

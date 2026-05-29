@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/app.css" />
+    <link rel="stylesheet" href="/app.css?v=claude2web-20260509-copytap" />
   </head>
   <body>
     <a class="skip-link" href="#main-content">跳到主内容</a>
@@ -108,6 +108,7 @@
 
             <form id="composerForm" class="composer-form" novalidate>
               <label class="sr-only" for="composerInput">下一条指令</label>
+              <div id="imagePreviewList" class="image-preview-list" aria-label="待发送图片" hidden></div>
               <div class="composer-row">
                 <textarea
                   id="composerInput"
@@ -123,7 +124,7 @@
                       id="quickCommandButton"
                       class="icon-button composer-more"
                       type="button"
-                      aria-label="选择常用指令"
+                      aria-label="打开更多操作"
                       aria-expanded="false"
                       aria-haspopup="menu"
                       aria-controls="quickCommandMenu"
@@ -139,23 +140,63 @@
                       </svg>
                     </button>
                     <div id="quickCommandMenu" class="quick-command-menu" role="menu" hidden>
-                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="按照SOP继续推进">
-                        按照SOP继续推进
-                      </button>
-                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="继续">
-                        继续
-                      </button>
-                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="同意">
-                        同意
-                      </button>
-                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="修一下issue">
-                        修一下issue
-                      </button>
-                      <button class="quick-command-item" type="button" role="menuitem" data-quick-command="验收issue">
-                        验收issue
-                      </button>
+                      <div id="quickCommandMainPanel" class="quick-command-panel">
+                        <button class="quick-command-item" type="button" role="menuitem" data-menu-panel="phrases">
+                          选择常用语
+                        </button>
+                        <button class="quick-command-item" type="button" role="menuitem" data-menu-panel="models">
+                          选择模型
+                        </button>
+                      </div>
+                      <div id="quickPhrasePanel" class="quick-command-panel" hidden>
+                        <button class="quick-command-back" type="button" data-menu-panel="main">返回</button>
+                        <button class="quick-command-item" type="button" role="menuitem" data-quick-command="按照SOP继续推进">
+                          按照SOP继续推进
+                        </button>
+                        <button class="quick-command-item" type="button" role="menuitem" data-quick-command="继续">
+                          继续
+                        </button>
+                        <button class="quick-command-item" type="button" role="menuitem" data-quick-command="同意">
+                          同意
+                        </button>
+                        <button class="quick-command-item" type="button" role="menuitem" data-quick-command="修一下issue">
+                          修一下issue
+                        </button>
+                        <button class="quick-command-item" type="button" role="menuitem" data-quick-command="验收issue">
+                          验收issue
+                        </button>
+                        <button class="quick-command-item" type="button" role="menuitem" data-quick-command="用codex做对抗性评审">
+                          用codex做对抗性评审
+                        </button>
+                        <button class="quick-command-item" type="button" role="menuitem" data-quick-command="用agency agents多专家做多抗性评审">
+                          用agency agents多专家做多抗性评审
+                        </button>
+                      </div>
+                      <div id="quickModelPanel" class="quick-command-panel" hidden>
+                        <button class="quick-command-back" type="button" data-menu-panel="main">返回</button>
+                        <div id="modelOptionList" class="model-option-list" role="group" aria-label="模型列表"></div>
+                      </div>
                     </div>
                   </div>
+                  <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+                  <button
+                    id="attachImageButton"
+                    class="icon-button composer-attach"
+                    type="button"
+                    aria-label="添加图片"
+                    aria-controls="imagePreviewList"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        d="M6 17.5 9.8 13a1.4 1.4 0 0 1 2.1 0l2.1 2.4 1.1-1.3a1.4 1.4 0 0 1 2.1 0l2.8 3.4M8.5 9.5h.01M6.8 4.5h10.4a2.3 2.3 0 0 1 2.3 2.3v10.4a2.3 2.3 0 0 1-2.3 2.3H6.8a2.3 2.3 0 0 1-2.3-2.3V6.8a2.3 2.3 0 0 1 2.3-2.3Z"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="1.8"
+                      />
+                    </svg>
+                  </button>
                   <button id="sendButton" class="btn-primary composer-send" type="button" aria-label="发送">
                     <svg class="action-icon-send" viewBox="0 0 24 24" aria-hidden="true">
                       <path
@@ -235,30 +276,6 @@
           <p id="executionSummary" class="panel-note">policy: unknown</p>
         </section>
 
-        <section class="drawer-block qa-block" aria-labelledby="qaTitle">
-          <div class="section-head">
-            <h3 id="qaTitle">测试工具</h3>
-            <span class="qa-chip">仅测试</span>
-          </div>
-          <div class="qa-actions">
-            <button id="simulateReconnect" class="btn-secondary" type="button">恢复连接</button>
-            <button id="simulateDisconnect" class="btn-secondary" type="button">断流演示</button>
-          </div>
-          <ul class="failures">
-            <li>
-              <button class="btn-danger" type="button" data-failure="connection">触发连接失败</button>
-              <p>验证断流后发送被阻止，并且恢复提示清晰可见。</p>
-            </li>
-            <li>
-              <button class="btn-danger" type="button" data-failure="session">触发附着失败</button>
-              <p>验证重新显式选择会话时不会发生静默回退。</p>
-            </li>
-            <li>
-              <button class="btn-danger" type="button" data-failure="send">触发发送失败</button>
-              <p>验证发送失败时错误只贴近主聊天路径出现。</p>
-            </li>
-          </ul>
-        </section>
       </div>
 
       <div class="drawer-mobile-dismiss" role="presentation">
@@ -273,6 +290,6 @@
       </div>
     </aside>
 
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="/app.js?v=claude2web-20260509-copytap"></script>
   </body>
 </html>

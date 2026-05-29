@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "activePhase": "P12",
+  "activePhase": "P17",
   "phases": [
     {
       "id": "P1",
@@ -197,6 +197,48 @@
       "status": "closed",
       "title": "Browser Execution Permission Parity and Trust Boundary",
       "updatedAt": "2026-04-25T03:57:07.169Z"
+    },
+    {
+      "id": "P15",
+      "title": "Provider Architecture and Claude Readonly Viewer",
+      "status": "closed",
+      "specPath": "spec-kit/phases/p15-provider-architecture-and-claude-readonly-viewer.md",
+      "updatedAt": "2026-04-30T15:21:00.131Z",
+      "gates": {
+        "plan": true,
+        "review": true,
+        "execute": true,
+        "qa": true,
+        "acceptance": true
+      }
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P16",
+      "specPath": "spec-kit/phases/p16-claude-send-resume-readiness-and-minimal-interactive-path.md",
+      "status": "closed",
+      "title": "Claude Send Resume Readiness and Minimal Interactive Path",
+      "updatedAt": "2026-04-30T15:29:38.933Z"
+    },
+    {
+      "gates": {
+        "acceptance": true,
+        "execute": true,
+        "plan": true,
+        "qa": true,
+        "review": true
+      },
+      "id": "P17",
+      "specPath": "spec-kit/phases/p17-claude-runtime-gateway-auth-repair.md",
+      "status": "closed",
+      "title": "Claude Runtime Gateway Auth Repair",
+      "updatedAt": "2026-04-30T15:46:40.502Z"
     }
   ]
 }

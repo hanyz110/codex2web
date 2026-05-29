@@ -12,8 +12,10 @@
     "external:launchd-status": "node scripts/install-macos-launchd.mjs status",
     "external:uninstall-launchd": "node scripts/install-macos-launchd.mjs uninstall",
     "external:trusted": "node scripts/external-access.mjs launch --remote-trusted",
+    "claude:diagnose": "node scripts/claude-runtime-diagnostics.mjs",
     "spec:status": "node scripts/spec-kit.mjs status",
     "spec:autoplan": "node scripts/spec-kit.mjs autoplan",
-    "spec:gate": "node scripts/spec-kit.mjs gate"
+    "spec:gate": "node scripts/spec-kit.mjs gate",
+    "claude:deploy-local": "node scripts/claude-deploy-local.mjs"
   }
 }
