@@ -1950,7 +1950,8 @@ function renderState() {
   renderModelMenu();
   const providerCanSend = provider.capabilities?.send !== false;
   const providerCanStop = provider.capabilities?.stop !== false;
-  const canSend = state.connection === "connected" && state.attach === "attached" && providerCanSend;
+  const canUseComposerTools = state.connection === "connected" && state.attach === "attached";
+  const canSend = canUseComposerTools && providerCanSend;
   const feedback = deriveExecutionFeedback();
   const visibleFeedback = providerCanSend
     ? feedback
@@ -1990,7 +1991,7 @@ function renderState() {
     composerInput.placeholder = providerCanSend ? "" : "当前 provider 尚未通过发送就绪检查";
   }
   if (quickCommandButton) {
-    quickCommandButton.disabled = !providerCanSend;
+    quickCommandButton.disabled = !canUseComposerTools;
   }
   if (attachImageButton) {
     attachImageButton.disabled = !providerCanSend;
