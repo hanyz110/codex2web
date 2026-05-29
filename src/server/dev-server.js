@@ -482,11 +482,13 @@ function requestAuth(res, req) {
     return;
   }
 
-  res.writeHead(401, {
-    "content-type": "text/plain; charset=utf-8",
-    "www-authenticate": 'Basic realm="Codex2Web External Access", charset="UTF-8"',
+  sendJson(res, 401, {
+    error: {
+      code: "AUTH_REQUIRED",
+      message: "登录状态已失效，请刷新页面重新登录后再试。",
+    },
+    ok: false,
   });
-  res.end("Authentication Required");
 }
 function sendSseEvent(res, eventName, payload) {
   res.write(`event: ${eventName}\n`);

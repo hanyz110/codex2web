@@ -2206,6 +2206,7 @@ async function requestJson(url, options) {
     const response = await fetch(resolveApiUrl(url), {
       ...options,
       cache: "no-store",
+      credentials: "include",
       signal: controller.signal,
     });
     const payload = await response.json().catch(() => null);
