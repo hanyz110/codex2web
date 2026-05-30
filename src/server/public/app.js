@@ -419,6 +419,13 @@ function deriveExecutionFeedback() {
   const executionState = state.executionState;
   const connectionReady = state.connection === "connected";
   const statusDetail = executionState?.statusDetail || "";
+  const toolActivity = executionState?.lastToolActivity || null;
+  const toolSummary = toolActivity?.summary ? String(toolActivity.summary).trim() : "";
+  const toolName = toolActivity?.name ? String(toolActivity.name).trim() : "工具";
+  const toolAgeMs = toolActivity?.time ? elapsedSince(toolActivity.time) : 0;
+  const toolDetail = toolSummary
+    ? `最近工具活动：${toolName} · ${toolSummary}${toolAgeMs > 0 ? `（${formatDuration(toolAgeMs)}前更新）` : ""}`
+    : "";
 
   if (state.send === "stopping") {
     return {
@@ -481,7 +488,9 @@ function deriveExecutionFeedback() {
         noActivitySince >= EXECUTION_STALLED_HINT_MS
       ) {
         return {
-          detail: `最近 ${formatDuration(noVisibleSince)} 没有新输出，且执行进程没有新活动。建议点击停止后重试。`,
+          detail: toolDetail
+            ? `最近 ${formatDuration(noVisibleSince)} 没有新可见消息，且执行进程 ${formatDuration(noActivitySince)} 没有新活动。${toolDetail}。建议点击停止后重试。`
+            : `最近 ${formatDuration(noVisibleSince)} 没有新输出，且执行进程没有新活动。建议点击停止后重试。`,
           durationMs: noVisibleSince,
           kind: "stalled",
           summary: "执行可能卡住，已长时间无输出",
@@ -490,7 +499,9 @@ function deriveExecutionFeedback() {
 
       if (noVisibleSince >= EXECUTION_NO_OUTPUT_HINT_MS) {
         return {
-          detail: `最近 ${formatDuration(noVisibleSince)} 没有新的可见消息，但执行进程仍在运行。`,
+          detail: toolDetail
+            ? `最近 ${formatDuration(noVisibleSince)} 没有新的助手回复，但执行进程仍在运行。${toolDetail}。`
+            : `最近 ${formatDuration(noVisibleSince)} 没有新的可见消息，但执行进程仍在运行。`,
           durationMs: noVisibleSince,
           kind: "quiet",
           summary: "仍在执行，暂时没有新输出",
@@ -1535,7 +1546,12 @@ function renderTranscript() {
 
     const label = document.createElement("span");
     label.className = "message-label";
-    label.textContent = entry.role === "user" ? "你" : state.provider?.displayName || "Assistant";
+    label.textContent =
+      entry.role === "user"
+        ? "你"
+        : entry.role === "tool"
+          ? "工具活动"
+          : state.provider?.displayName || "Assistant";
 
     const time = document.createElement("span");
     time.className = "timestamp";

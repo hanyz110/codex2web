@@ -597,7 +597,8 @@ h3 {
 }
 
 .message.assistant,
-.message.system {
+.message.system,
+.message.tool {
   border-left: 0;
   background: transparent;
 }
@@ -606,6 +607,12 @@ h3 {
   padding-left: 8px;
   border-left: 2px solid rgba(37, 99, 235, 0.45);
   background: linear-gradient(90deg, rgba(219, 234, 254, 0.28), transparent 42%);
+}
+
+.message.tool {
+  padding-left: 8px;
+  border-left: 2px solid rgba(20, 184, 166, 0.42);
+  background: linear-gradient(90deg, rgba(240, 253, 250, 0.7), transparent 48%);
 }
 
 .flow-status-card {
@@ -764,9 +771,19 @@ h3 {
 }
 
 .message.assistant .message-body,
-.message.system .message-body {
+.message.system .message-body,
+.message.tool .message-body {
   background: transparent;
   border-left: none;
+}
+
+.message.tool .message-label {
+  color: #0f766e;
+}
+
+.message.tool .message-body {
+  color: #334155;
+  font-size: 13px;
 }
 
 .message.assistant .message-body {

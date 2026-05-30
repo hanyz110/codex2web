@@ -344,6 +344,24 @@ async function collectClaudeModelsFromChangelog(target) {
   }
 }
 
+async function collectClaudeModelsFromCliHelp(target, binaryPath = DEFAULT_CLAUDE_BINARY) {
+  const result = await runClaudeCommand({
+    args: ["-p", "--help"],
+    binaryPath,
+    cwd: os.tmpdir(),
+    timeoutMs: 10000,
+  });
+  if (result.error || result.code !== 0) {
+    return;
+  }
+
+  const text = `${result.stdout || ""}\n${result.stderr || ""}`;
+  const matches = text.matchAll(/\bclaude-(opus|sonnet|haiku)-\d+-\d+(?:-\d{8})?(?:\[\d+m\])?\b/gi);
+  for (const match of matches) {
+    addModelOption(target, modelOption({ model: match[0], provider: "claude", source: "claude-cli-help" }));
+  }
+}
+
 function buildDeepSeekModelOptions() {
   const candidates = [
     DEEPSEEK_MODEL_ENV.ANTHROPIC_MODEL,
@@ -359,7 +377,7 @@ function buildDeepSeekModelOptions() {
   return Array.from(byKey.values());
 }
 
-async function discoverDynamicModelCatalog() {
+export async function discoverDynamicModelCatalog({ claudeBinaryPath = DEFAULT_CLAUDE_BINARY } = {}) {
   const byKey = new Map();
   for (const option of buildDeepSeekModelOptions()) {
     addModelOption(byKey, option);
@@ -374,6 +392,7 @@ async function discoverDynamicModelCatalog() {
   collectClaudeModelsFromConfig(globalConfig, byKey, []);
   await collectClaudeDesktopSessionModels(byKey);
   await collectClaudeModelsFromChangelog(byKey);
+  await collectClaudeModelsFromCliHelp(byKey, claudeBinaryPath);
 
   return pruneModelCatalog(Array.from(byKey.values())).sort((left, right) => {
     if (left.provider !== right.provider) {
@@ -421,10 +440,11 @@ function modelSortRank(option) {
   }
 
   const lower = option.model.toLowerCase();
-  if (lower === "opus" || lower.includes("opus-4-7")) return 10;
-  if (lower === "sonnet" || lower.includes("sonnet-4-6")) return 11;
-  if (lower === "haiku" || lower.includes("haiku-4-5")) return 12;
-  if (lower.includes("opus-4-6")) return 13;
+  if (lower === "opus" || lower.includes("opus-4-8")) return 10;
+  if (lower.includes("opus-4-7")) return 11;
+  if (lower === "sonnet" || lower.includes("sonnet-4-6")) return 12;
+  if (lower === "haiku" || lower.includes("haiku-4-5")) return 13;
+  if (lower.includes("opus-4-6")) return 14;
   return 30;
 }
 
@@ -546,6 +566,100 @@ function extractClaudeContentText(content) {
   return parts.join("\n\n").trim();
 }
 
+function truncateToolText(value, limit = 900) {
+  const text = trimText(value).replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+  if (text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, limit - 1).trimEnd()}…`;
+}
+
+function summarizeToolInput(name, input) {
+  if (!input || typeof input !== "object") {
+    return "";
+  }
+
+  const toolName = trimText(name);
+  if (toolName === "Bash") {
+    return truncateToolText(input.description || input.command || "");
+  }
+  if (toolName === "Read") {
+    return truncateToolText(input.file_path || "");
+  }
+  if (toolName === "Glob") {
+    return truncateToolText([input.pattern, input.path].filter(Boolean).join(" · "));
+  }
+  if (toolName === "Grep") {
+    return truncateToolText([input.pattern, input.path].filter(Boolean).join(" · "));
+  }
+  if (toolName === "WebFetch") {
+    return truncateToolText(input.url || input.prompt || "");
+  }
+
+  const compact = JSON.stringify(input);
+  return truncateToolText(compact || "");
+}
+
+function summarizeToolResult(record, block) {
+  const result = record?.toolUseResult && typeof record.toolUseResult === "object" ? record.toolUseResult : {};
+  const content = typeof block?.content === "string" ? block.content : "";
+  const stdout = typeof result.stdout === "string" ? result.stdout : "";
+  const stderr = typeof result.stderr === "string" ? result.stderr : "";
+  const error = typeof result.error === "string" ? result.error : "";
+  const source = error || stderr || stdout || content;
+  return truncateToolText(source || "工具已返回结果。");
+}
+
+export function extractClaudeToolActivity(record) {
+  const role = record?.message?.role || record?.type;
+  const content = record?.message?.content;
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  if (role === "assistant") {
+    const block = content.find((item) => item && typeof item === "object" && item.type === "tool_use");
+    if (!block) {
+      return null;
+    }
+    const name = trimText(block.name) || "工具";
+    const summary = summarizeToolInput(name, block.input);
+    const command = name === "Bash" ? truncateToolText(block.input?.command || "", 1200) : "";
+    return {
+      detail: command,
+      name,
+      status: "running",
+      summary: summary || `正在执行 ${name}`,
+      text: [
+        `正在执行工具：${name}`,
+        summary ? `检查内容：${summary}` : "",
+        command ? `命令：\n\`\`\`bash\n${command}\n\`\`\`` : "",
+      ].filter(Boolean).join("\n\n"),
+    };
+  }
+
+  if (role === "user") {
+    const block = content.find((item) => item && typeof item === "object" && item.type === "tool_result");
+    if (!block) {
+      return null;
+    }
+    const isError = Boolean(block.is_error || record?.toolUseResult?.is_error);
+    const summary = summarizeToolResult(record, block);
+    return {
+      detail: summary,
+      name: "工具",
+      status: isError ? "error" : "done",
+      summary: isError ? "工具返回错误" : "工具返回结果",
+      text: [
+        isError ? "工具返回错误" : "工具返回结果",
+        summary ? `结果摘要：\n\`\`\`text\n${summary}\n\`\`\`` : "",
+      ].filter(Boolean).join("\n\n"),
+    };
+  }
+
+  return null;
+}
+
 function formatTranscriptRole(role) {
   return role === "assistant" ? "Assistant" : "User";
 }
@@ -612,6 +726,17 @@ function normalizeClaudeRecord(sessionId, record, lineNumber) {
 
   if (record?.type !== "user" && record?.type !== "assistant") {
     return null;
+  }
+
+  const toolActivity = extractClaudeToolActivity(record);
+  if (toolActivity) {
+    return {
+      id: `${sessionId}:tool:${lineNumber}`,
+      role: "tool",
+      text: toolActivity.text,
+      time: record.timestamp || nowIso(),
+      toolActivity,
+    };
   }
 
   const text = extractClaudeContentText(record.message?.content);
@@ -919,10 +1044,22 @@ function formatExecutionModelDetail(selection, evidence) {
   return `选择模型：${selected}；实际模型：${actual}。`;
 }
 
-function buildClaudePromptWithImages(prompt, imagePaths, imageAnalyses = []) {
+export function buildClaudePromptWithImages(prompt, imagePaths, { imageAnalyses = [], imageMode = "native" } = {}) {
   const cleanPrompt = trimText(prompt);
   if (!Array.isArray(imagePaths) || imagePaths.length === 0) {
     return cleanPrompt;
+  }
+
+  if (imageMode !== "ocr") {
+    const imageSections = imagePaths.map((filePath, index) => `图片 ${index + 1}: ${filePath}`);
+    return [
+      cleanPrompt,
+      "",
+      "已附加图片文件。请直接读取并理解这些本地图片；必要时使用 Read 工具查看原图，不要把它当作 OCR 文本处理。",
+      "",
+      "图片文件：",
+      ...imageSections,
+    ].join("\n");
   }
 
   const analysisByPath = new Map(
@@ -953,7 +1090,7 @@ function buildClaudePromptWithImages(prompt, imagePaths, imageAnalyses = []) {
   return [
     cleanPrompt,
     "",
-    "已附加图片。注意：当前 Claude2Web 使用 DeepSeek Anthropic 兼容接口，官方不支持原生 image content，因此服务端已先对图片执行 OCR，并把可读文本作为上下文提供。",
+    "已附加图片。注意：当前模型使用 DeepSeek Anthropic 兼容接口，无法稳定接收 Claude Code 原生 image content，因此服务端已先对图片执行 OCR，并把可读文本作为上下文提供。",
     "请基于用户问题、下方 OCR 文本和文件路径回答；不要再说无法直接查看图片，除非 OCR 文本不足以判断。",
     "",
     "图片 OCR 上下文：",
@@ -1239,6 +1376,7 @@ export class ClaudeReadonlyBridge {
       acceptedAt: null,
       exitCode: null,
       lastActivityAt: null,
+      lastToolActivity: null,
       lastVisibleMessageAt: null,
       actualModel: null,
       modelUsage: null,
@@ -1373,8 +1511,10 @@ export class ClaudeReadonlyBridge {
       const now = Date.now();
       const startedAtMs = Date.parse(runContext.startedAt);
       const lastVisibleAtMs = Date.parse(runContext.lastVisibleMessageAt || runContext.acceptedAt || runContext.startedAt);
+      const lastToolAtMs = Date.parse(runContext.lastToolActivity?.time || "");
       const runtimeMs = Number.isFinite(startedAtMs) ? now - startedAtMs : 0;
       const quietVisibleMs = Number.isFinite(lastVisibleAtMs) ? now - lastVisibleAtMs : 0;
+      const quietToolMs = Number.isFinite(lastToolAtMs) ? now - lastToolAtMs : quietVisibleMs;
 
       if (runtimeMs >= EXECUTION_MAX_RUNTIME_MS) {
         this.#requestRunStop(session, runContext, {
@@ -1385,8 +1525,11 @@ export class ClaudeReadonlyBridge {
       }
 
       if (quietVisibleMs >= EXECUTION_VISIBLE_OUTPUT_STALL_MS) {
+        const toolSummary = trimText(runContext.lastToolActivity?.summary);
         this.#requestRunStop(session, runContext, {
-          detail: `Claude 执行已超过 ${Math.round(EXECUTION_VISIBLE_OUTPUT_STALL_MS / 60000)} 分钟没有新的可见输出，已自动停止并释放发送锁。`,
+          detail: toolSummary
+            ? `Claude 执行已超过 ${Math.round(EXECUTION_VISIBLE_OUTPUT_STALL_MS / 60000)} 分钟没有新的可见输出；最近工具活动：${toolSummary}，已 ${Math.round(quietToolMs / 1000)} 秒无更新。已自动停止并释放发送锁。`
+            : `Claude 执行已超过 ${Math.round(EXECUTION_VISIBLE_OUTPUT_STALL_MS / 60000)} 分钟没有新的可见输出，已自动停止并释放发送锁。`,
           status: "stopping",
         });
         return;
@@ -1746,7 +1889,7 @@ export class ClaudeReadonlyBridge {
   }
 
   async #refreshModelCatalog() {
-    this.#modelCatalog = await discoverDynamicModelCatalog();
+    this.#modelCatalog = await discoverDynamicModelCatalog({ claudeBinaryPath: this.#claudeBinaryPath });
     this.#modelCatalogRefreshedAt = nowIso();
   }
 
@@ -1900,7 +2043,11 @@ export class ClaudeReadonlyBridge {
 
     return new Promise((resolve, reject) => {
       const currentModel = this.#getCurrentModelSelection();
-      const promptWithImages = buildClaudePromptWithImages(prompt, imagePaths, imageAnalyses);
+      const imageMode = currentModel.provider === "deepseek" ? "ocr" : "native";
+      const promptWithImages = buildClaudePromptWithImages(prompt, imagePaths, {
+        imageAnalyses,
+        imageMode,
+      });
       const readableDirs = Array.from(new Set([
         session.projectPath,
         ...imagePaths.map((filePath) => path.dirname(filePath)).filter(Boolean),
@@ -1936,6 +2083,7 @@ export class ClaudeReadonlyBridge {
         acceptedAt: null,
         child,
         lastVisibleMessageAt: null,
+        lastToolActivity: null,
         startedAt: nowIso(),
         stallWatchdogTimer: null,
         stopEscalationTimer: null,
@@ -2285,15 +2433,31 @@ export class ClaudeReadonlyBridge {
       if (executionState && (executionState.phase === "starting" || executionState.phase === "running")) {
         const visibleAt = entry.time || nowIso();
         const runContext = this.#activeSendRuns.get(session.id);
+        const toolActivity = entry.toolActivity
+          ? {
+              detail: entry.toolActivity.detail || "",
+              name: entry.toolActivity.name || "工具",
+              status: entry.toolActivity.status || "running",
+              summary: entry.toolActivity.summary || entry.text || "",
+              time: visibleAt,
+            }
+          : null;
         if (runContext) {
-          runContext.lastVisibleMessageAt = visibleAt;
+          if (toolActivity) {
+            runContext.lastToolActivity = toolActivity;
+          } else {
+            runContext.lastVisibleMessageAt = visibleAt;
+          }
         }
         this.#setExecutionState(session.id, {
           lastActivityAt: visibleAt,
-          lastVisibleMessageAt: visibleAt,
+          lastToolActivity: toolActivity || executionState.lastToolActivity || null,
+          lastVisibleMessageAt: toolActivity ? executionState.lastVisibleMessageAt || null : visibleAt,
           phase: "running",
           processAlive: true,
-          statusDetail: "Claude 执行中，已收到新的可见输出。",
+          statusDetail: toolActivity
+            ? `${toolActivity.status === "running" ? "正在执行" : "刚完成"} ${toolActivity.name}：${toolActivity.summary}`
+            : "Claude 执行中，已收到新的可见输出。",
         }, { emit: false });
       }
       this.#emit("message", { entry, sessionId: session.id });

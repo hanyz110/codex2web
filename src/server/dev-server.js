@@ -798,7 +798,8 @@ async function handleApi(req, res, parsedUrl) {
     if (method === "POST" && pathname === "/api/session/send") {
       const body = await readJsonBody(req, MAX_SEND_BODY_BYTES);
       const imagePaths = await persistImageAttachments(body.images);
-      const imageAnalyses = runImageOcr(imagePaths);
+      const currentProvider = bridge.getProviderInfo?.()?.model?.current?.provider || "";
+      const imageAnalyses = currentProvider === "deepseek" ? runImageOcr(imagePaths) : [];
       const result = await bridge.sendInput(body.message, { imageAnalyses, imagePaths });
       sendJson(res, 200, { ok: true, result });
       return;
