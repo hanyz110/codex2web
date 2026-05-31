@@ -110,6 +110,41 @@ npm run external:install-launchd -- --pass '<password>'
 3. verify the page is not on an old cached script
 4. restart the external process and reconnect the tunnel
 
+## Public URL is very slow or returns Cloudflare 530
+
+Root cause observed on some networks: `cloudflared` can default to QUIC and repeatedly log `timeout: no recent network activity`, which makes Cloudflare complete TLS but never receive a timely origin response.
+
+Another failure mode is a live `cloudflared` process with closed edge connections. In that case launchd sees the process as running, but Cloudflare can intermittently return `530` or phone browsers can fail during the reconnect window.
+
+Confirm:
+
+```bash
+tail -120 ~/Library/Logs/codex2web/external-launchd.err.log | rg 'Initial protocol|Failed to dial|no recent network activity|530|connection with edge closed|watchdog'
+npm run external:health -- --pass '<password>' --attempts 3
+```
+
+Expected stable tunnel config includes:
+
+```yaml
+protocol: http2
+```
+
+Fix:
+
+1. use the launchd/external launcher from this repo, which generates named tunnel configs with `protocol: http2`
+2. keep the public watchdog enabled so short `502/530` bursts are retried instead of restarting everything
+3. on sustained failures, the watchdog restarts only the `cloudflared` child process and keeps the Node server alive
+4. rerun `npm run external:health -- --pass '<password>' --attempts 3`
+
+Watchdog defaults:
+
+```bash
+CODEX2WEB_PUBLIC_WATCHDOG_INTERVAL_MS=15000
+CODEX2WEB_PUBLIC_WATCHDOG_TIMEOUT_MS=10000
+CODEX2WEB_PUBLIC_WATCHDOG_FAILURES=6
+CODEX2WEB_PUBLIC_WATCHDOG_RESTART_COOLDOWN_MS=120000
+```
+
 ## Browser-triggered gstack browse says Bun is missing
 
 Root cause: the external service is often started by `launchd`, which does not inherit the same shell startup files as your terminal. If the service `PATH` lacks `~/.bun/bin`, a browser-initiated Codex turn can fail with:

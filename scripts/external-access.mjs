@@ -12,6 +12,10 @@ const DEFAULT_PORT = 4321;
 const READY_TIMEOUT_MS = 20_000;
 const PUBLIC_URL_TIMEOUT_MS = 45_000;
 const PUBLIC_VERIFY_TIMEOUT_MS = 60_000;
+const PUBLIC_WATCHDOG_FAILURES = 6;
+const PUBLIC_WATCHDOG_INTERVAL_MS = 15_000;
+const PUBLIC_WATCHDOG_RESTART_COOLDOWN_MS = 120_000;
+const PUBLIC_WATCHDOG_TIMEOUT_MS = 10_000;
 
 function buildRuntimePath(env = process.env) {
   const homeDir = env.HOME || process.env.HOME || "";
@@ -82,6 +86,18 @@ function randomPassword() {
   return crypto.randomBytes(18).toString("base64url");
 }
 
+function parsePositiveInt(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function isExplicitlyDisabled(value) {
+  return ["0", "false", "no", "off"].includes(String(value || "").toLowerCase());
+}
+
 function pickProvider(explicitProvider) {
   if (explicitProvider) {
     return explicitProvider;
@@ -139,6 +155,7 @@ function safeFileSegment(value) {
 }
 
 async function createNamedTunnelConfig({ configFile, credentialsFile, hostname, port, tunnelId, tunnelName }) {
+  const tunnelProtocol = process.env.CODEX2WEB_CLOUDFLARE_PROTOCOL || process.env.TUNNEL_TRANSPORT_PROTOCOL || "http2";
   const configPath = configFile
     ? path.resolve(configFile)
     : path.resolve(
@@ -148,6 +165,7 @@ async function createNamedTunnelConfig({ configFile, credentialsFile, hostname, 
   const configContent = [
     `tunnel: ${tunnelId}`,
     `credentials-file: ${credentialsFile}`,
+    `protocol: ${tunnelProtocol}`,
     "ingress:",
     `  - hostname: ${hostname}`,
     `    service: http://127.0.0.1:${port}`,
@@ -240,6 +258,16 @@ async function waitForLocalReady(port, user, pass) {
   throw new Error(`Timed out waiting for local external-mode server on port ${String(port)}.`);
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = PUBLIC_WATCHDOG_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function verifyPublicUrl(publicUrl, user, pass) {
   const startedAt = Date.now();
   let lastError = null;
@@ -285,6 +313,102 @@ async function verifyPublicUrl(publicUrl, user, pass) {
   throw new Error(
     `Timed out verifying public URL. Last error: ${String(lastError?.message || lastError || "unknown")}`,
   );
+}
+
+async function probePublicHealth(publicUrl, user, pass, timeoutMs) {
+  const unauthorized = await fetchWithTimeout(publicUrl, { redirect: "manual" }, timeoutMs);
+  const authorized = await fetchWithTimeout(
+    `${publicUrl}/api/system/meta`,
+    {
+      headers: {
+        authorization: authHeader(user, pass),
+      },
+    },
+    timeoutMs,
+  );
+
+  if (unauthorized.status !== 401 || !authorized.ok) {
+    throw new Error(
+      `public health failed: unauth=${String(unauthorized.status)} auth=${String(authorized.status)}`,
+    );
+  }
+}
+
+function startPublicWatchdog({ onSustainedFailure, publicUrl, user, pass }) {
+  if (isExplicitlyDisabled(process.env.CODEX2WEB_PUBLIC_WATCHDOG)) {
+    process.stdout.write("Public watchdog disabled by CODEX2WEB_PUBLIC_WATCHDOG.\n");
+    return null;
+  }
+
+  const intervalMs = parsePositiveInt(process.env.CODEX2WEB_PUBLIC_WATCHDOG_INTERVAL_MS, PUBLIC_WATCHDOG_INTERVAL_MS);
+  const restartCooldownMs = parsePositiveInt(
+    process.env.CODEX2WEB_PUBLIC_WATCHDOG_RESTART_COOLDOWN_MS,
+    PUBLIC_WATCHDOG_RESTART_COOLDOWN_MS,
+  );
+  const failureThreshold = parsePositiveInt(
+    process.env.CODEX2WEB_PUBLIC_WATCHDOG_FAILURES,
+    PUBLIC_WATCHDOG_FAILURES,
+  );
+  const timeoutMs = parsePositiveInt(process.env.CODEX2WEB_PUBLIC_WATCHDOG_TIMEOUT_MS, PUBLIC_WATCHDOG_TIMEOUT_MS);
+  let consecutiveFailures = 0;
+  let lastRestartAt = 0;
+  let running = false;
+
+  process.stdout.write(
+    `Public watchdog enabled: interval=${String(intervalMs)}ms failures=${String(failureThreshold)} timeout=${String(timeoutMs)}ms restartCooldown=${String(restartCooldownMs)}ms.\n`,
+  );
+
+  const tick = async () => {
+    if (running) {
+      return;
+    }
+    running = true;
+    try {
+      await probePublicHealth(publicUrl, user, pass, timeoutMs);
+      if (consecutiveFailures > 0) {
+        process.stderr.write("[watchdog] public health recovered.\n");
+      }
+      consecutiveFailures = 0;
+    } catch (error) {
+      consecutiveFailures += 1;
+      process.stderr.write(
+        `[watchdog] public health failure ${String(consecutiveFailures)}/${String(failureThreshold)}: ${String(
+          error.message || error,
+        )}\n`,
+      );
+      if (consecutiveFailures >= failureThreshold) {
+        const now = Date.now();
+        if (now - lastRestartAt < restartCooldownMs) {
+          process.stderr.write(
+            "[watchdog] public health failure threshold reached, but tunnel restart is still cooling down.\n",
+          );
+          consecutiveFailures = Math.max(1, failureThreshold - 1);
+          return;
+        }
+
+        lastRestartAt = now;
+        process.stderr.write("[watchdog] public health failure threshold reached; restarting tunnel only.\n");
+        consecutiveFailures = 0;
+        try {
+          await onSustainedFailure?.();
+        } catch (restartError) {
+          process.stderr.write(
+            `[watchdog] tunnel restart failed; keeping server alive: ${String(
+              restartError.message || restartError,
+            )}\n`,
+          );
+        }
+      }
+    } finally {
+      running = false;
+    }
+  };
+
+  const interval = setInterval(() => {
+    void tick();
+  }, intervalMs);
+  interval.unref?.();
+  return interval;
 }
 
 function capturePublicUrl(child, provider) {
@@ -363,6 +487,19 @@ function streamChild(prefix, child) {
   });
 }
 
+function waitForChildClose(child, timeoutMs = 5_000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      resolve(false);
+    }, timeoutMs);
+    timer.unref?.();
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0] || "launch";
@@ -402,8 +539,11 @@ async function main() {
 
   streamChild("server", serverChild);
   let tunnelCleanupPaths = [];
+  let isShuttingDown = false;
+  let plannedTunnelRestart = false;
 
   const cleanup = () => {
+    isShuttingDown = true;
     serverChild.kill("SIGTERM");
     if (tunnelChild) {
       tunnelChild.kill("SIGTERM");
@@ -442,11 +582,43 @@ async function main() {
       "Remote trusted mode enabled: the external browser entry will run with local-equivalent dangerous execution authority.\n",
     );
   }
-  tunnelChild = spawn(tunnelCommand.cmd, tunnelCommand.args, {
-    env: serviceEnv,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  streamChild(tunnelCommand.displayName, tunnelChild);
+  const spawnTunnelChild = () => {
+    const child = spawn(tunnelCommand.cmd, tunnelCommand.args, {
+      env: serviceEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    streamChild(tunnelCommand.displayName, child);
+    child.on("close", (code) => {
+      if (isShuttingDown || plannedTunnelRestart) {
+        return;
+      }
+      process.stderr.write(
+        `[watchdog] tunnel exited unexpectedly with code ${String(code)}; restarting tunnel only.\n`,
+      );
+      tunnelChild = spawnTunnelChild();
+    });
+    return child;
+  };
+
+  const restartTunnelOnly = async () => {
+    if (!tunnelChild) {
+      tunnelChild = spawnTunnelChild();
+      return;
+    }
+
+    const oldTunnelChild = tunnelChild;
+    plannedTunnelRestart = true;
+    oldTunnelChild.kill("SIGTERM");
+    const closed = await waitForChildClose(oldTunnelChild);
+    if (!closed) {
+      oldTunnelChild.kill("SIGKILL");
+      await waitForChildClose(oldTunnelChild, 2_000);
+    }
+    plannedTunnelRestart = false;
+    tunnelChild = spawnTunnelChild();
+  };
+
+  tunnelChild = spawnTunnelChild();
 
   const publicUrl = tunnelCommand.publicUrl || (await capturePublicUrl(tunnelChild, provider));
   let verification = null;
@@ -494,13 +666,17 @@ async function main() {
     ].join("\n"),
   );
 
+  startPublicWatchdog({
+    onSustainedFailure: restartTunnelOnly,
+    pass: basicPass,
+    publicUrl,
+    user: basicUser,
+  });
+
   await Promise.race([
     new Promise((resolve, reject) => {
       serverChild.on("close", (code) => {
         reject(new Error(`External server exited unexpectedly with code ${String(code)}.`));
-      });
-      tunnelChild.on("close", (code) => {
-        reject(new Error(`Tunnel exited unexpectedly with code ${String(code)}.`));
       });
     }),
     new Promise(() => {}),

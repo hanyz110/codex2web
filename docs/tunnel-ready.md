@@ -219,4 +219,6 @@ Behavior:
 1. launchd keeps `npm run external:trusted` alive with `KeepAlive=true`
 2. credentials are stored in `~/Library/Application Support/codex2web/external/launchd.env` with `0600` permissions
 3. logs are written to `~/Library/Logs/codex2web/external-launchd.*.log`
-4. uninstall with `npm run external:uninstall-launchd`
+4. named Cloudflare tunnel configs default to `protocol: http2` to avoid QUIC/UDP instability on restrictive networks
+5. the public watchdog probes the authenticated external URL, tolerates short `502/530` bursts, and restarts only the `cloudflared` child process on sustained failures
+6. uninstall with `npm run external:uninstall-launchd`

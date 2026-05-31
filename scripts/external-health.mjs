@@ -37,7 +37,10 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_M
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const startedAt = Date.now();
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    response.elapsedMs = Date.now() - startedAt;
+    return response;
   } finally {
     clearTimeout(timer);
   }
@@ -55,7 +58,12 @@ async function probeMeta(url, user, pass) {
   const response = await fetchWithTimeout(`${url}/api/system/meta`, {
     headers: { authorization: authHeader(user, pass) },
   });
-  return { body: await readJson(response), ok: response.ok, status: response.status };
+  return {
+    body: await readJson(response),
+    ok: response.ok,
+    responseElapsedMs: response.elapsedMs,
+    status: response.status,
+  };
 }
 
 async function probeHealth({ localUrl, pass, publicUrl, user }) {
@@ -80,6 +88,7 @@ async function probeHealth({ localUrl, pass, publicUrl, user }) {
     checks,
     dnsAddresses,
     local: {
+      elapsedMs: localMeta.responseElapsedMs,
       executionProfile: localMeta.body?.execution?.profile || null,
       externalMode: localMeta.body?.externalMode || false,
       status: localMeta.status,
@@ -89,7 +98,9 @@ async function probeHealth({ localUrl, pass, publicUrl, user }) {
       authMode: publicMeta.body?.security?.authMode || null,
       executionProfile: publicMeta.body?.execution?.profile || null,
       externalMode: publicMeta.body?.externalMode || false,
+      metaElapsedMs: publicMeta.responseElapsedMs,
       metaStatus: publicMeta.status,
+      unauthElapsedMs: publicUnauth.elapsedMs,
       unauthStatus: publicUnauth.status,
     },
   };
