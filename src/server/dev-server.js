@@ -146,6 +146,7 @@ const MAX_BODY_BYTES = 64 * 1024;
 const BINDING_TRANSCRIPT_LIMIT = 20;
 const BINDING_TRANSCRIPT_BYTES_BUDGET = 16 * 1024;
 const STREAM_REPLAY_TRANSCRIPT_LIMIT = 20;
+const HISTORY_TRANSCRIPT_PAGE_LIMIT = 80;
 const MAX_SEND_BODY_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGE_ATTACHMENTS = 4;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -796,6 +797,29 @@ async function handleApi(req, res, parsedUrl) {
               entries: trimTranscriptTail(snapshot.entries),
             }
           : snapshot,
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === "/api/session/history") {
+      if (typeof bridge.getTranscriptHistoryPage !== "function") {
+        throw new BridgeError(501, "Current provider does not support transcript history paging.", "HISTORY_UNSUPPORTED");
+      }
+      await bridge.discoverSessions();
+      const beforeId = String(parsedUrl.searchParams.get("before") || "");
+      const requestedLimit = Number(parsedUrl.searchParams.get("limit") || HISTORY_TRANSCRIPT_PAGE_LIMIT);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(200, Math.floor(requestedLimit)))
+        : HISTORY_TRANSCRIPT_PAGE_LIMIT;
+      const history = await bridge.getTranscriptHistoryPage({
+        beforeId,
+        limit,
+        sessionId: clientSessionId,
+      });
+      sendJson(res, 200, {
+        binding: bridge.getBinding(clientSessionId),
+        history,
+        ok: true,
       });
       return;
     }

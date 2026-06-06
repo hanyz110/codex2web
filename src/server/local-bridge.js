@@ -6,6 +6,7 @@ import path from "node:path";
 
 const DEFAULT_CODEX_BINARY = path.join(os.homedir(), ".bun", "bin", "codex");
 const DEFAULT_TRANSCRIPT_LIMIT = 300;
+const HISTORY_TRANSCRIPT_LIMIT = 3000;
 const TRANSCRIPT_TAIL_INITIAL_READ_BYTES = 512 * 1024;
 const TRANSCRIPT_TAIL_MAX_READ_BYTES = 24 * 1024 * 1024;
 const SEND_ACCEPT_TIMEOUT_MS = 1500;
@@ -168,7 +169,7 @@ async function readJsonlSlice(filePath, offset, length) {
   }
 }
 
-async function readTranscriptTail(filePath, fileSize) {
+async function readTranscriptTail(filePath, fileSize, minimumLineCount = DEFAULT_TRANSCRIPT_LIMIT * 3) {
   const maxReadBytes = Math.min(fileSize, TRANSCRIPT_TAIL_MAX_READ_BYTES);
   let readBytes = Math.min(fileSize, TRANSCRIPT_TAIL_INITIAL_READ_BYTES);
 
@@ -176,7 +177,7 @@ async function readTranscriptTail(filePath, fileSize) {
     const offset = Math.max(0, fileSize - readBytes);
     const raw = await readJsonlSlice(filePath, offset, fileSize - offset);
     const lines = raw.split("\n").filter((line) => line.trim());
-    if (offset === 0 || lines.length >= DEFAULT_TRANSCRIPT_LIMIT * 3 || readBytes >= maxReadBytes) {
+    if (offset === 0 || lines.length >= minimumLineCount || readBytes >= maxReadBytes) {
       return { offset, raw };
     }
 
@@ -218,9 +219,10 @@ async function loadSessionIndex(indexPath) {
   return metadata;
 }
 
-async function parseTranscriptFile(session) {
+async function parseTranscriptFile(session, { limit = DEFAULT_TRANSCRIPT_LIMIT } = {}) {
   const fileInfo = await stat(session.filePath);
-  const { offset, raw } = await readTranscriptTail(session.filePath, fileInfo.size);
+  const safeLimit = Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : DEFAULT_TRANSCRIPT_LIMIT);
+  const { offset, raw } = await readTranscriptTail(session.filePath, fileInfo.size, safeLimit * 3);
   const records = [];
   const startsAtBeginning = offset === 0;
   let lineNumber = startsAtBeginning ? 0 : offset;
@@ -255,7 +257,7 @@ async function parseTranscriptFile(session) {
     }
   }
 
-  const trimmed = transcript.slice(-DEFAULT_TRANSCRIPT_LIMIT);
+  const trimmed = transcript.slice(-safeLimit);
   return {
     cursor: {
       emittedIds: new Set(trimmed.map((entry) => entry.id)),
@@ -266,6 +268,24 @@ async function parseTranscriptFile(session) {
     },
     transcript: trimmed,
   };
+}
+
+function findTranscriptAnchorIndex(entries, anchor) {
+  if (!anchor) {
+    return -1;
+  }
+
+  const byId = entries.findIndex((entry) => entry.id === anchor.id);
+  if (byId >= 0) {
+    return byId;
+  }
+
+  const anchorText = trimText(anchor.text);
+  return entries.findIndex((entry) => (
+    entry.role === anchor.role &&
+    trimText(entry.text) === anchorText &&
+    String(entry.time || "") === String(anchor.time || "")
+  ));
 }
 
 export class LocalSessionBridge {
@@ -602,6 +622,47 @@ export class LocalSessionBridge {
       entries: transcript.map((entry) => ({ ...entry })),
       latestEntryId,
       reset: true,
+    };
+  }
+
+  async getTranscriptHistoryPage({ beforeId = "", limit = 80, sessionId = this.#pinnedSessionId } = {}) {
+    if (!sessionId || !beforeId) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: null,
+      };
+    }
+
+    await this.#refreshSessions();
+    const session = this.#getSession(sessionId);
+    if (!session) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: null,
+      };
+    }
+
+    const safeLimit = Math.max(1, Math.min(200, Number.isFinite(Number(limit)) ? Math.floor(Number(limit)) : 80));
+    const visibleTranscript = this.#transcriptCache.get(sessionId) || await this.getTranscript(sessionId);
+    const visibleAnchor = visibleTranscript.find((entry) => entry.id === beforeId) || { id: beforeId };
+    const { transcript } = await parseTranscriptFile(session, { limit: HISTORY_TRANSCRIPT_LIMIT });
+    const anchorIndex = findTranscriptAnchorIndex(transcript, visibleAnchor);
+    if (anchorIndex <= 0) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: transcript[0]?.id || null,
+      };
+    }
+
+    const startIndex = Math.max(0, anchorIndex - safeLimit);
+    const entries = transcript.slice(startIndex, anchorIndex);
+    return {
+      entries: entries.map((entry) => ({ ...entry })),
+      hasMore: startIndex > 0,
+      oldestEntryId: transcript[0]?.id || null,
     };
   }
 

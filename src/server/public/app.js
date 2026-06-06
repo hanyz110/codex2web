@@ -116,6 +116,9 @@ let stream = null;
 let hadStreamError = false;
 let lastTransportActivityAt = 0;
 let shouldStickToBottom = true;
+let transcriptHistoryLoading = false;
+let transcriptHistoryHasMore = true;
+let transcriptHistorySessionId = "";
 let snapshotPollInFlight = false;
 let snapshotPollMs = 0;
 let snapshotPollTimer = null;
@@ -143,6 +146,8 @@ const EXTERNAL_STALE_SNAPSHOT_MS = 6000;
 const EXTERNAL_STALE_RECONNECT_MS = 12000;
 const EXECUTION_NO_OUTPUT_HINT_MS = 8000;
 const EXECUTION_STALLED_HINT_MS = 20000;
+const TRANSCRIPT_HISTORY_PAGE_SIZE = 80;
+const TRANSCRIPT_HISTORY_TOP_THRESHOLD_PX = 96;
 const DRAWER_EDGE_SWIPE_MAX_WIDTH = 768;
 const DRAWER_EDGE_SWIPE_RIGHT_INSET_PX = 16;
 const DRAWER_EDGE_SWIPE_ZONE_PX = 108;
@@ -2065,6 +2070,7 @@ function renderState() {
 }
 
 function updateBinding(binding) {
+  const previousSessionId = state.pinnedSessionId || "";
   state.attach = binding.attach;
   state.connection = binding.connection;
   state.executionState = binding.executionState || null;
@@ -2074,6 +2080,11 @@ function updateBinding(binding) {
   state.provider = binding.provider || state.provider;
   state.sessionName = binding.session?.name || "未绑定真实会话";
   state.sessionProjectPath = binding.session?.projectPath || "unknown";
+  if (previousSessionId !== state.pinnedSessionId) {
+    transcriptHistoryHasMore = true;
+    transcriptHistoryLoading = false;
+    transcriptHistorySessionId = state.pinnedSessionId || "";
+  }
 
   const projectLabel = basename(state.sessionProjectPath);
 
@@ -2189,6 +2200,8 @@ function replaceTranscript(entries) {
   for (const entry of state.transcript) {
     seenMessageIds.add(entry.id);
   }
+  transcriptHistoryHasMore = true;
+  transcriptHistorySessionId = state.pinnedSessionId || "";
   shouldStickToBottom = true;
   renderTranscript();
   window.requestAnimationFrame(() => {
@@ -2196,6 +2209,81 @@ function replaceTranscript(entries) {
       scrollTranscriptToBottom();
     }
   });
+}
+
+function getOldestTranscriptId() {
+  for (const entry of state.transcript) {
+    if (!entry?.pending) {
+      return entry.id || "";
+    }
+  }
+
+  return "";
+}
+
+function prependTranscriptHistory(entries) {
+  const olderEntries = Array.isArray(entries)
+    ? entries.filter((entry) => entry?.id && !seenMessageIds.has(entry.id))
+    : [];
+  if (olderEntries.length === 0) {
+    return;
+  }
+
+  const previousScrollHeight = transcriptList.scrollHeight;
+  const previousScrollTop = transcriptList.scrollTop;
+  for (const entry of olderEntries) {
+    seenMessageIds.add(entry.id);
+  }
+  state.transcript = [...olderEntries, ...state.transcript];
+  shouldStickToBottom = false;
+  renderTranscript();
+  window.requestAnimationFrame(() => {
+    transcriptList.scrollTop = transcriptList.scrollHeight - previousScrollHeight + previousScrollTop;
+    updateJumpToLatestVisibility();
+  });
+}
+
+async function loadOlderTranscriptHistory() {
+  if (transcriptHistoryLoading || !transcriptHistoryHasMore || state.transcript.length === 0) {
+    return;
+  }
+
+  const beforeId = getOldestTranscriptId();
+  if (!beforeId) {
+    transcriptHistoryHasMore = false;
+    return;
+  }
+
+  const requestSessionId = state.pinnedSessionId || "";
+  transcriptHistoryLoading = true;
+  transcriptList?.setAttribute("aria-busy", "true");
+  try {
+    const payload = await requestJson(
+      `/api/session/history?before=${encodeURIComponent(beforeId)}&limit=${TRANSCRIPT_HISTORY_PAGE_SIZE}&_ts=${Date.now()}`,
+    );
+    const nextBinding = requireBinding(payload.binding, "历史记录加载");
+    const payloadSessionId = nextBinding.pinnedSessionId || "";
+    if (
+      requestSessionId &&
+      ((state.pinnedSessionId && state.pinnedSessionId !== requestSessionId) ||
+        (payloadSessionId && payloadSessionId !== requestSessionId))
+    ) {
+      return;
+    }
+
+    updateBinding(nextBinding);
+    const history = payload.history || {};
+    prependTranscriptHistory(Array.isArray(history.entries) ? history.entries : []);
+    transcriptHistoryHasMore = Boolean(history.hasMore);
+    transcriptHistorySessionId = state.pinnedSessionId || "";
+  } catch (error) {
+    setAlert(error.message);
+  } finally {
+    transcriptHistoryLoading = false;
+    if (operationLoadingCount === 0) {
+      transcriptList?.setAttribute("aria-busy", "false");
+    }
+  }
 }
 
 function reconcileTranscript(entries) {
@@ -2632,6 +2720,12 @@ document.addEventListener("pointercancel", handleDrawerPointerCancel);
 transcriptList?.addEventListener("scroll", () => {
   shouldStickToBottom = isNearBottom();
   updateJumpToLatestVisibility();
+  if (
+    transcriptList.scrollTop <= TRANSCRIPT_HISTORY_TOP_THRESHOLD_PX &&
+    transcriptHistorySessionId === (state.pinnedSessionId || "")
+  ) {
+    void loadOlderTranscriptHistory();
+  }
 });
 
 transcriptList?.addEventListener("click", async (event) => {

@@ -187,6 +187,75 @@ test("extractClaudeToolActivity summarizes tool results", () => {
   assert.match(activity.text, /25 passed/);
 });
 
+test("Claude transcript history page can load entries older than the initial tail", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "claude2web-history-page-"));
+  const sessionRoot = path.join(tempDir, "projects");
+  const projectDir = path.join(sessionRoot, "project");
+  const sessionId = "history-page-session";
+  const sessionPath = path.join(projectDir, `${sessionId}.jsonl`);
+  const fakeClaude = path.join(tempDir, "claude");
+
+  await mkdir(projectDir, { recursive: true });
+  await writeFile(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"--help\" ]; then",
+      "  echo \"--model claude-opus-4-8\"",
+      "  exit 0",
+      "fi",
+      "exit 0",
+    ].join("\n"),
+    "utf-8",
+  );
+  await chmod(fakeClaude, 0o755);
+
+  const records = [];
+  for (let index = 1; index <= 380; index += 1) {
+    records.push(
+      JSON.stringify({
+        cwd: projectDir,
+        message: {
+          content: [{ text: `history message ${index}`, type: "text" }],
+          role: index % 2 === 0 ? "assistant" : "user",
+        },
+        sessionId,
+        timestamp: `2026-06-01T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+        type: index % 2 === 0 ? "assistant" : "user",
+      }),
+    );
+  }
+  await writeFile(sessionPath, records.join("\n"), "utf-8");
+
+  try {
+    const bridge = new ClaudeReadonlyBridge({
+      auditFilePath: path.join(tempDir, "audit.jsonl"),
+      claudeBinaryPath: fakeClaude,
+      sendRequested: true,
+      sessionRootPath: sessionRoot,
+      stateFilePath: path.join(tempDir, "state.json"),
+    });
+    await bridge.init();
+
+    const snapshot = await bridge.getTranscriptSnapshot({ forceFull: true, sessionId });
+    assert.equal(snapshot.entries.length, 300);
+    assert.equal(snapshot.entries[0].text, "history message 81");
+
+    const page = await bridge.getTranscriptHistoryPage({
+      beforeId: snapshot.entries[0].id,
+      limit: 25,
+      sessionId,
+    });
+
+    assert.equal(page.entries.length, 25);
+    assert.equal(page.entries[0].text, "history message 56");
+    assert.equal(page.entries.at(-1).text, "history message 80");
+    assert.equal(page.hasMore, true);
+  } finally {
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
 test("Claude send launches from the session cwd so --resume can locate the conversation", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "claude2web-resume-cwd-"));
   const sessionRoot = path.join(tempDir, "projects");

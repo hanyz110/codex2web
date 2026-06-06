@@ -11,6 +11,7 @@ import { BridgeError } from "../local-bridge.js";
 const DEFAULT_CLAUDE_BINARY = "claude";
 const DEFAULT_CLAUDE_PROJECTS_ROOT = path.join(os.homedir(), ".claude", "projects");
 const DEFAULT_TRANSCRIPT_LIMIT = 300;
+const HISTORY_TRANSCRIPT_LIMIT = 3000;
 const TRANSCRIPT_TAIL_INITIAL_READ_BYTES = 512 * 1024;
 const TRANSCRIPT_TAIL_MAX_READ_BYTES = 24 * 1024 * 1024;
 const SEND_ACCEPT_TIMEOUT_MS = 1500;
@@ -976,7 +977,7 @@ async function readJsonlSlice(filePath, offset, length) {
   }
 }
 
-async function readTranscriptTail(filePath, fileSize) {
+async function readTranscriptTail(filePath, fileSize, minimumLineCount = DEFAULT_TRANSCRIPT_LIMIT * 3) {
   const maxReadBytes = Math.min(fileSize, TRANSCRIPT_TAIL_MAX_READ_BYTES);
   let readBytes = Math.min(fileSize, TRANSCRIPT_TAIL_INITIAL_READ_BYTES);
 
@@ -984,7 +985,7 @@ async function readTranscriptTail(filePath, fileSize) {
     const offset = Math.max(0, fileSize - readBytes);
     const raw = await readJsonlSlice(filePath, offset, fileSize - offset);
     const lines = raw.split("\n").filter((line) => line.trim());
-    if (offset === 0 || lines.length >= DEFAULT_TRANSCRIPT_LIMIT * 3 || readBytes >= maxReadBytes) {
+    if (offset === 0 || lines.length >= minimumLineCount || readBytes >= maxReadBytes) {
       return { offset, raw };
     }
 
@@ -1082,9 +1083,10 @@ async function readClaudeSessionMetadata(filePath) {
   };
 }
 
-async function parseClaudeTranscriptFile(session) {
+async function parseClaudeTranscriptFile(session, { limit = DEFAULT_TRANSCRIPT_LIMIT } = {}) {
   const fileInfo = await stat(session.filePath);
-  const { offset, raw } = await readTranscriptTail(session.filePath, fileInfo.size);
+  const safeLimit = Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : DEFAULT_TRANSCRIPT_LIMIT);
+  const { offset, raw } = await readTranscriptTail(session.filePath, fileInfo.size, safeLimit * 3);
   const transcript = [];
   const startsAtBeginning = offset === 0;
   let lineNumber = startsAtBeginning ? 0 : offset;
@@ -1112,7 +1114,7 @@ async function parseClaudeTranscriptFile(session) {
     }
   }
 
-  const trimmed = transcript.slice(-DEFAULT_TRANSCRIPT_LIMIT);
+  const trimmed = transcript.slice(-safeLimit);
   return {
     cursor: {
       emittedIds: new Set(trimmed.map((entry) => entry.id)),
@@ -1167,6 +1169,45 @@ function mergeTranscriptEntries(baseEntries, overlayEntries) {
       return String(left.id || "").localeCompare(String(right.id || ""));
     })
     .slice(-DEFAULT_TRANSCRIPT_LIMIT);
+}
+
+function mergeTranscriptEntriesWithLimit(baseEntries, overlayEntries, limit = DEFAULT_TRANSCRIPT_LIMIT) {
+  const safeLimit = Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : DEFAULT_TRANSCRIPT_LIMIT);
+  const byId = new Map();
+  for (const entry of [...baseEntries, ...overlayEntries]) {
+    if (!entry?.id) {
+      continue;
+    }
+    byId.set(entry.id, entry);
+  }
+
+  return Array.from(byId.values())
+    .sort((left, right) => {
+      const timeOrder = String(left.time || "").localeCompare(String(right.time || ""));
+      if (timeOrder !== 0) {
+        return timeOrder;
+      }
+      return String(left.id || "").localeCompare(String(right.id || ""));
+    })
+    .slice(-safeLimit);
+}
+
+function findTranscriptAnchorIndex(entries, anchor) {
+  if (!anchor) {
+    return -1;
+  }
+
+  const byId = entries.findIndex((entry) => entry.id === anchor.id);
+  if (byId >= 0) {
+    return byId;
+  }
+
+  const anchorText = trimText(anchor.text);
+  return entries.findIndex((entry) => (
+    entry.role === anchor.role &&
+    trimText(entry.text) === anchorText &&
+    String(entry.time || "") === String(anchor.time || "")
+  ));
 }
 
 async function inspectClaudeSessionThinking(filePath) {
@@ -1963,6 +2004,67 @@ export class ClaudeReadonlyBridge {
       entries: transcript.map((entry) => ({ ...entry })),
       latestEntryId,
       reset: true,
+    };
+  }
+
+  async getTranscriptHistoryPage({ beforeId = "", limit = 80, sessionId = this.#pinnedSessionId } = {}) {
+    if (!sessionId || !beforeId) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: null,
+      };
+    }
+
+    await this.#refreshSessions();
+    const session = this.#getSession(sessionId);
+    if (!session?.filePath) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: null,
+      };
+    }
+
+    const safeLimit = Math.max(1, Math.min(200, Number.isFinite(Number(limit)) ? Math.floor(Number(limit)) : 80));
+    const visibleTranscript = this.#transcriptCache.get(sessionId) || await this.getTranscript(sessionId);
+    const visibleAnchor = visibleTranscript.find((entry) => entry.id === beforeId) || { id: beforeId };
+
+    let parsedTranscript;
+    try {
+      parsedTranscript = await parseClaudeTranscriptFile(session, { limit: HISTORY_TRANSCRIPT_LIMIT });
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return {
+          entries: [],
+          hasMore: false,
+          oldestEntryId: null,
+        };
+      }
+      throw error;
+    }
+
+    const logicalEntries = await this.#readLogicalTranscript(sessionId, { limit: HISTORY_TRANSCRIPT_LIMIT });
+    const transcript = mergeTranscriptEntriesWithLimit(
+      parsedTranscript.transcript,
+      logicalEntries,
+      HISTORY_TRANSCRIPT_LIMIT,
+    );
+    const anchorIndex = findTranscriptAnchorIndex(transcript, visibleAnchor);
+    if (anchorIndex <= 0) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: transcript[0]?.id || null,
+      };
+    }
+
+    const startIndex = Math.max(0, anchorIndex - safeLimit);
+    const entries = transcript.slice(startIndex, anchorIndex);
+    return {
+      entries: entries.map((entry) => ({ ...entry })),
+      hasMore: startIndex > 0,
+      oldestEntryId: transcript[0]?.id || null,
     };
   }
 
@@ -3081,7 +3183,7 @@ export class ClaudeReadonlyBridge {
     return path.join(this.#logicalTranscriptDir, `${safeSessionId}.jsonl`);
   }
 
-  async #readLogicalTranscript(sessionId) {
+  async #readLogicalTranscript(sessionId, { limit = DEFAULT_TRANSCRIPT_LIMIT } = {}) {
     const filePath = this.#getLogicalTranscriptPath(sessionId);
     if (!filePath) {
       return [];
@@ -3112,7 +3214,7 @@ export class ClaudeReadonlyBridge {
       entries.push(entry);
     }
     this.#logicalTranscriptPersistedIds.set(sessionId, persistedIds);
-    return entries.slice(-DEFAULT_TRANSCRIPT_LIMIT);
+    return entries.slice(-Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : DEFAULT_TRANSCRIPT_LIMIT));
   }
 
   async #appendLogicalTranscriptEntry(sessionId, entry) {
