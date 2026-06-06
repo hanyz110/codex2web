@@ -159,9 +159,10 @@ function readLaunchEnv() {
 
 async function writeAppPlist() {
   const command = [
-    `cd ${JSON.stringify(RUNTIME_LINK)}`,
+    `cd ${JSON.stringify(RUNTIME_DIR)}`,
+    `export PWD=${JSON.stringify(RUNTIME_DIR)}`,
     "set -a",
-    `source ${JSON.stringify(ENV_LINK)}`,
+    `source ${JSON.stringify(ENV_PATH)}`,
     "set +a",
     "exec npm start",
   ].join(" && ");
@@ -182,6 +183,8 @@ async function writeAppPlist() {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>WorkingDirectory</key>
+  <string>${xmlEscape(RUNTIME_DIR)}</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>

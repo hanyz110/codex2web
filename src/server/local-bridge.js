@@ -502,14 +502,15 @@ export class LocalSessionBridge {
     this.#emit("state", this.getBinding());
   }
 
-  getBinding() {
-    const session = this.#getSession(this.#pinnedSessionId);
+  getBinding(sessionId = this.#pinnedSessionId) {
+    const effectiveSessionId = trimText(sessionId) || this.#pinnedSessionId;
+    const session = this.#getSession(effectiveSessionId);
     const connection = this.#failureModes.connection ? "error" : "connected";
     const attach = this.#failureModes.attach || !session ? "error" : "attached";
     const stream = this.#failureModes.connection ? "idle" : "streaming";
-    const stopStatus = this.#getStopStatus(this.#pinnedSessionId);
-    const executionState = this.#getExecutionState(this.#pinnedSessionId);
-    const isSending = this.#sendingSessionIds.has(this.#pinnedSessionId);
+    const stopStatus = this.#getStopStatus(effectiveSessionId);
+    const executionState = this.#getExecutionState(effectiveSessionId);
+    const isSending = this.#sendingSessionIds.has(effectiveSessionId);
     const send = this.#failureModes.send
       ? "error"
       : executionState?.phase === "failed"
@@ -529,7 +530,7 @@ export class LocalSessionBridge {
       connection,
       execution: this.getExecutionPolicy(),
       executionState,
-      pinnedSessionId: this.#pinnedSessionId,
+      pinnedSessionId: effectiveSessionId,
       provider: this.getProviderInfo(),
       send,
       session: session ? this.#toPublicSession(session) : null,
@@ -604,7 +605,7 @@ export class LocalSessionBridge {
     };
   }
 
-  async attachSession(sessionId, explicit) {
+  async attachSession(sessionId, explicit, options = {}) {
     if (explicit !== true) {
       throw new BridgeError(
         400,
@@ -620,8 +621,10 @@ export class LocalSessionBridge {
     }
 
     const previousPinnedSessionId = this.#pinnedSessionId;
-    this.#pinnedSessionId = target.id;
-    await this.#persistPinnedSessionId();
+    if (options.persist !== false) {
+      this.#pinnedSessionId = target.id;
+      await this.#persistPinnedSessionId();
+    }
     this.#recordAudit({
       action: "session_switch",
       detail: "User explicitly switched the pinned local Codex session.",
@@ -633,9 +636,9 @@ export class LocalSessionBridge {
       session: this.#toPublicSession(target),
       updatedAt: nowIso(),
     });
-    this.#emit("state", this.getBinding());
+    this.#emit("state", this.getBinding(options.persist === false ? target.id : undefined));
 
-    return this.getBinding();
+    return this.getBinding(options.persist === false ? target.id : undefined);
   }
 
   async sendInput(message) {

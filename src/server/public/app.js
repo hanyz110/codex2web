@@ -128,6 +128,7 @@ const COMPOSER_MIN_HEIGHT = 38;
 const DRAWER_CLOSE_TRANSITION_MS = 240;
 const MIN_OPERATION_LOADING_MS = 300;
 const FAVORITE_STORAGE_KEY = "codex2web.sessionFavorites.v1";
+const CLIENT_ID_STORAGE_KEY = "claude2web.clientId.v1";
 const REQUEST_TIMEOUT_MS = 12000;
 const BOOT_LOADING_MAX_MS = 15000;
 const MESSAGE_COPY_DOUBLE_TAP_MS = 520;
@@ -164,6 +165,29 @@ let bootStage = "恢复会话";
 let alertAutoHideTimerId = 0;
 let drawerGesture = null;
 let pendingImages = [];
+
+function createClientId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `client-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function getClientId() {
+  try {
+    const existing = window.localStorage.getItem(CLIENT_ID_STORAGE_KEY);
+    if (existing) {
+      return existing;
+    }
+    const next = createClientId();
+    window.localStorage.setItem(CLIENT_ID_STORAGE_KEY, next);
+    return next;
+  } catch {
+    return createClientId();
+  }
+}
+
+const clientId = getClientId();
 
 function setText(target, value) {
   if (target) {
@@ -2077,7 +2101,7 @@ function findMatchingOptimisticMessage(entry) {
 
   return state.transcript.find(
     (candidate) =>
-      candidate.pending &&
+      optimisticMessageIds.has(candidate.id) &&
       candidate.role === "user" &&
       normalizeMessageText(candidate.text) === text,
   ) || null;
@@ -2140,6 +2164,22 @@ function removeOptimisticMessage(messageId) {
   optimisticMessageIds.delete(messageId);
   seenMessageIds.delete(messageId);
   state.transcript = state.transcript.filter((entry) => entry.id !== messageId);
+  renderTranscript();
+}
+
+function finalizeOptimisticMessage(messageId) {
+  if (!messageId || !optimisticMessageIds.has(messageId)) {
+    return;
+  }
+
+  const entry = state.transcript.find((candidate) => candidate.id === messageId);
+  if (!entry) {
+    optimisticMessageIds.delete(messageId);
+    seenMessageIds.delete(messageId);
+    return;
+  }
+
+  entry.pending = false;
   renderTranscript();
 }
 
@@ -2215,20 +2255,42 @@ function resolveApiUrl(url) {
   return new URL(url, window.location.origin).toString();
 }
 
+function parseJsonResponseText(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 async function requestJson(url, options) {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const requestUrl = resolveApiUrl(url);
 
   try {
-    const response = await fetch(resolveApiUrl(url), {
+    const response = await fetch(requestUrl, {
       ...options,
       cache: "no-store",
       credentials: "include",
+      headers: {
+        ...(options?.headers || {}),
+        "x-codex2web-client-id": clientId,
+      },
       signal: controller.signal,
     });
-    const payload = await response.json().catch(() => null);
+    const contentType = response.headers.get("content-type") || "";
+    const responseText = await response.text();
+    const payload = responseText ? parseJsonResponseText(responseText) : null;
     if (payload == null) {
-      throw new Error("服务返回了非 JSON 响应，可能是鉴权或穿透链路异常，请刷新页面重试。");
+      const preview = responseText.trim().replace(/\s+/g, " ").slice(0, 120);
+      const detail = [
+        `HTTP ${String(response.status)}`,
+        new URL(requestUrl).pathname,
+        contentType ? `content-type=${contentType}` : "",
+        preview ? `body=${preview}` : "",
+      ].filter(Boolean).join(" · ");
+      throw new Error(`服务返回了非 JSON 响应：${detail}。请刷新页面重试。`);
     }
     if (!response.ok || payload.ok === false) {
       const message = payload?.error?.message || "请求失败";
@@ -2423,7 +2485,10 @@ function reconnectStream() {
   }
 
   const afterId = encodeURIComponent(getLatestTranscriptId());
-  const streamUrl = afterId ? `/api/session/stream?after=${afterId}` : "/api/session/stream";
+  const clientParam = `clientId=${encodeURIComponent(clientId)}`;
+  const streamUrl = afterId
+    ? `/api/session/stream?after=${afterId}&${clientParam}`
+    : `/api/session/stream?${clientParam}`;
   stream = new EventSource(resolveApiUrl(streamUrl));
   state.connection = "connecting";
   renderState();
@@ -2748,6 +2813,7 @@ async function attachSessionById(sessionId, switchButton, sessionLabel) {
       forceFull: true,
       silent: true,
     });
+    reconnectStream();
     setAlert("");
     jumpToChatView();
   } catch (error) {
@@ -3048,8 +3114,6 @@ async function sendCurrentMessage() {
       headers: { "content-type": "application/json" },
       method: "POST",
     });
-    await syncBindingSnapshot({ silent: true });
-    clearPendingImages();
   } catch (error) {
     removeOptimisticMessage(optimisticMessageId);
     composerInput.value = value;
@@ -3057,6 +3121,16 @@ async function sendCurrentMessage() {
     state.send = "error";
     renderState();
     setAlert(error.message);
+    return;
+  }
+
+  finalizeOptimisticMessage(optimisticMessageId);
+  clearPendingImages();
+
+  try {
+    await syncBindingSnapshot({ silent: true });
+  } catch (error) {
+    setAlert(`消息已发送，但状态刷新失败：${error.message}`);
   }
 }
 

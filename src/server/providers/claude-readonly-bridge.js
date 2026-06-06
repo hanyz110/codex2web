@@ -20,7 +20,11 @@ const SEND_TIMEOUT_MS = 600000;
 const SESSION_POLL_INTERVAL_MS = 1200;
 const SESSION_REFRESH_TTL_MS = 5000;
 const STOP_ESCALATION_TIMEOUT_MS = 3000;
+const RECENT_TRANSCRIPT_ADD_DIR_LIMIT = 8;
 const DEEPSEEK_FORK_CONTEXT_LIMIT = 12;
+const PROVIDER_BRIDGE_RECENT_ENTRY_LIMIT = 8;
+const PROVIDER_BRIDGE_CHAR_BUDGET = 6000;
+const PROVIDER_BRIDGE_OPUS_CHAR_BUDGET = 4200;
 const EXECUTION_STALL_WATCHDOG_INTERVAL_MS = readPositiveDuration(
   process.env.CODEX2WEB_STALL_WATCHDOG_INTERVAL_MS,
   5000,
@@ -83,12 +87,117 @@ function normalizePath(value) {
   return trimmed.length > 1 ? trimmed.replace(/\/+$/, "") : trimmed;
 }
 
+function isPathInside(childPath, parentPath) {
+  const child = normalizePath(childPath);
+  const parent = normalizePath(parentPath);
+  if (!child || !parent) {
+    return false;
+  }
+  return child === parent || child.startsWith(`${parent}${path.sep}`);
+}
+
+function extractAbsolutePathsFromString(value) {
+  const text = trimText(value);
+  if (!/(?:\/Users\/|\/Volumes\/|\/private\/var\/|\/var\/|\/tmp\/)/.test(text)) {
+    return [];
+  }
+
+  return Array.from(text.matchAll(/(?:\/Users|\/Volumes|\/private\/var|\/var|\/tmp)\/[^\n\r"'<>`]+/g))
+    .map((match) => normalizePath(match[0]
+      .replace(/:\d+$/g, "")
+      .replace(/[),.;，。；、\]}]+$/g, "")))
+    .filter(Boolean);
+}
+
+function collectAbsolutePathsFromValue(value, paths, depth = 0) {
+  if (depth > 6 || value == null) {
+    return;
+  }
+
+  if (typeof value === "string") {
+    for (const filePath of extractAbsolutePathsFromString(value)) {
+      paths.add(filePath);
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectAbsolutePathsFromValue(item, paths, depth + 1);
+    }
+    return;
+  }
+
+  if (typeof value === "object") {
+    for (const item of Object.values(value)) {
+      collectAbsolutePathsFromValue(item, paths, depth + 1);
+    }
+  }
+}
+
+async function pathExists(filePath) {
+  try {
+    await stat(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function findWorkspaceRootForPath(filePath, boundaryPath) {
+  const normalized = normalizePath(filePath);
+  const boundary = normalizePath(boundaryPath);
+  if (!normalized || !boundary || !isPathInside(normalized, boundary)) {
+    return "";
+  }
+
+  let current = normalized;
+  try {
+    const info = await stat(current);
+    if (!info.isDirectory()) {
+      current = path.dirname(current);
+    }
+  } catch {
+    current = path.extname(current) ? path.dirname(current) : current;
+  }
+
+  while (isPathInside(current, boundary)) {
+    const markerChecks = [
+      path.join(current, ".git"),
+      path.join(current, "package.json"),
+      path.join(current, "pnpm-workspace.yaml"),
+      path.join(current, "PRD.md"),
+      path.join(current, "OBJECT_MODEL.md"),
+    ];
+    for (const marker of markerChecks) {
+      if (await pathExists(marker)) {
+        return current;
+      }
+    }
+
+    if (current === boundary) {
+      break;
+    }
+    const parent = path.dirname(current);
+    if (!parent || parent === current) {
+      break;
+    }
+    current = parent;
+  }
+
+  return "";
+}
+
 function safeJsonParse(line) {
   try {
     return JSON.parse(line);
   } catch {
     return null;
   }
+}
+
+function safeFileName(value) {
+  return trimText(value).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 180);
 }
 
 async function readJsonFile(filePath) {
@@ -486,11 +595,15 @@ export function resolveModelSelection(catalog, request = {}) {
   return null;
 }
 
-function createClaudeExecutionEnv(selection) {
+function createClaudeExecutionEnv(selection, cwd = "") {
   const nextEnv = {
     ...process.env,
     TERM: process.env.TERM || "xterm-256color",
   };
+  const normalizedCwd = normalizePath(cwd);
+  if (normalizedCwd) {
+    nextEnv.PWD = normalizedCwd;
+  }
 
   for (const key of MODEL_ENV_KEYS) {
     delete nextEnv[key];
@@ -664,9 +777,69 @@ function formatTranscriptRole(role) {
   return role === "assistant" ? "Assistant" : "User";
 }
 
+function getProviderBridgeBudget(selection) {
+  const model = normalizeModelName(selection?.model).toLowerCase();
+  if (selection?.provider === "claude" && model.includes("opus")) {
+    return PROVIDER_BRIDGE_OPUS_CHAR_BUDGET;
+  }
+  return PROVIDER_BRIDGE_CHAR_BUDGET;
+}
+
+function buildProviderSwitchBridgePrompt({ bridge, prompt, selection, transcript }) {
+  const cleanPrompt = trimText(prompt);
+  const entries = (Array.isArray(transcript) ? transcript : [])
+    .filter((entry) => entry?.role === "user" || entry?.role === "assistant")
+    .filter((entry) => trimText(entry?.text))
+    .filter((entry) => !isDeepSeekSafeForkScaffoldText(entry.text))
+    .slice(-PROVIDER_BRIDGE_RECENT_ENTRY_LIMIT);
+
+  if (!bridge || entries.length === 0) {
+    return cleanPrompt;
+  }
+
+  const budget = getProviderBridgeBudget(selection);
+  let remaining = budget;
+  const context = [];
+  for (const entry of entries.reverse()) {
+    const role = formatTranscriptRole(entry.role);
+    const header = `${role} (${entry.time || "unknown time"}):`;
+    const textBudget = Math.max(280, remaining - header.length - 32);
+    const text = trimText(entry.text).slice(0, textBudget);
+    if (!text) {
+      continue;
+    }
+    const block = `${header}\n${text}`;
+    context.unshift(block);
+    remaining -= block.length;
+    if (remaining <= 0) {
+      break;
+    }
+  }
+
+  if (context.length === 0) {
+    return cleanPrompt;
+  }
+
+  return [
+    "以下是同一个 Claude2Web 可见会话在跨 provider 切换后带入的最近上下文恢复包。",
+    `切换方向：${bridge.fromProvider || "unknown"} -> ${bridge.toProvider || selection?.provider || "unknown"}`,
+    "注意：这不是新的用户请求，只用于恢复上下文；如与当前用户请求冲突，以当前用户请求为准。",
+    "",
+    "最近可见上下文：",
+    context.join("\n\n"),
+    "",
+    "当前用户请求：",
+    cleanPrompt,
+  ].join("\n");
+}
+
 function isDeepSeekSafeForkScaffoldText(text) {
   const value = trimText(text);
   return value.startsWith("这是一个自动创建的 DeepSeek 安全分支。");
+}
+
+function isDeepSeekSafeForkSession(session) {
+  return isDeepSeekSafeForkScaffoldText(session?.name || "");
 }
 
 export function buildDeepSeekSafeForkPrompt({ latestPrompt, sourceSessionId, transcript }) {
@@ -821,6 +994,42 @@ async function readTranscriptTail(filePath, fileSize) {
   return { offset: 0, raw: "" };
 }
 
+async function inferRecentTranscriptReadableDirs(session) {
+  if (!session?.filePath || !session?.projectPath) {
+    return [];
+  }
+
+  const boundaryPath = path.dirname(session.projectPath);
+  const paths = new Set();
+  try {
+    const fileInfo = await stat(session.filePath);
+    const { raw } = await readTranscriptTail(session.filePath, fileInfo.size);
+    const lines = raw.split("\n").filter((line) => line.trim()).slice(-120);
+    for (const line of lines) {
+      const parsed = safeJsonParse(line);
+      if (!parsed) {
+        continue;
+      }
+      collectAbsolutePathsFromValue(parsed, paths);
+    }
+  } catch {
+    return [];
+  }
+
+  const dirs = [];
+  for (const filePath of paths) {
+    if (dirs.length >= RECENT_TRANSCRIPT_ADD_DIR_LIMIT) {
+      break;
+    }
+    const workspaceRoot = await findWorkspaceRootForPath(filePath, boundaryPath);
+    if (workspaceRoot && workspaceRoot !== session.projectPath && !dirs.includes(workspaceRoot)) {
+      dirs.push(workspaceRoot);
+    }
+  }
+
+  return dirs;
+}
+
 async function readClaudeSessionMetadata(filePath) {
   const raw = await readFile(filePath, "utf-8");
   const fallbackId = path.basename(filePath, ".jsonl");
@@ -913,6 +1122,51 @@ async function parseClaudeTranscriptFile(session) {
     },
     transcript: trimmed,
   };
+}
+
+function normalizeLogicalTranscriptEntry(entry) {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+
+  const role = entry.role;
+  if (role !== "user" && role !== "assistant" && role !== "tool") {
+    return null;
+  }
+
+  const id = trimText(entry.id);
+  const text = trimText(entry.text);
+  if (!id || !text) {
+    return null;
+  }
+
+  return {
+    id,
+    role,
+    text,
+    time: trimText(entry.time) || nowIso(),
+    ...(entry.toolActivity && typeof entry.toolActivity === "object" ? { toolActivity: entry.toolActivity } : {}),
+  };
+}
+
+function mergeTranscriptEntries(baseEntries, overlayEntries) {
+  const byId = new Map();
+  for (const entry of [...baseEntries, ...overlayEntries]) {
+    if (!entry?.id) {
+      continue;
+    }
+    byId.set(entry.id, entry);
+  }
+
+  return Array.from(byId.values())
+    .sort((left, right) => {
+      const timeOrder = String(left.time || "").localeCompare(String(right.time || ""));
+      if (timeOrder !== 0) {
+        return timeOrder;
+      }
+      return String(left.id || "").localeCompare(String(right.id || ""));
+    })
+    .slice(-DEFAULT_TRANSCRIPT_LIMIT);
 }
 
 async function inspectClaudeSessionThinking(filePath) {
@@ -1178,6 +1432,10 @@ export class ClaudeReadonlyBridge {
   #modelCatalog = [];
   #modelCatalogRefreshedAt = null;
   #modelSelection = null;
+  #modelSelectionsBySession = new Map();
+  #pendingProviderBridgesBySession = new Map();
+  #providerRuns = { sessions: {} };
+  #providerRunsFilePath;
   #pinnedSessionId = null;
   #pollTimer = null;
   #readinessRefreshInFlight = null;
@@ -1186,11 +1444,15 @@ export class ClaudeReadonlyBridge {
   #sendRequested;
   #sendingSessionIds = new Set();
   #sessionCursors = new Map();
+  #sessionRunAliases = new Map();
+  #ephemeralSessionsById = new Map();
   #sessionRootPath;
   #sessions = [];
   #sessionsById = new Map();
   #stateFilePath;
   #transcriptCache = new Map();
+  #logicalTranscriptDir;
+  #logicalTranscriptPersistedIds = new Map();
 
   constructor({ auditFilePath, claudeBinaryPath, sendRequested = false, sessionRootPath, stateFilePath }) {
     this.#auditFilePath = auditFilePath;
@@ -1202,13 +1464,21 @@ export class ClaudeReadonlyBridge {
     });
     this.#sessionRootPath = normalizePath(sessionRootPath) || DEFAULT_CLAUDE_PROJECTS_ROOT;
     this.#stateFilePath = stateFilePath;
+    this.#logicalTranscriptDir = path.join(path.dirname(this.#stateFilePath), "claude-logical-transcripts");
+    this.#providerRunsFilePath = path.join(path.dirname(this.#stateFilePath), "claude-provider-runs.json");
   }
 
   async init() {
     await this.#refreshModelCatalog();
     await this.#refreshSessions(true);
+    await this.#readPersistedProviderRuns();
     const persistedState = await this.#readPersistedState();
     this.#modelSelection = this.#resolveInitialModelSelection(persistedState?.modelSelection);
+    this.#modelSelectionsBySession = new Map(
+      Object.entries(persistedState?.sessionModelSelections || {})
+        .map(([sessionId, selection]) => [sessionId, resolveModelSelection(this.#modelCatalog, selection || {})])
+        .filter(([sessionId, selection]) => sessionId && selection),
+    );
     await this.#refreshReadiness();
     const persistedSessionId = persistedState?.pinnedSessionId || null;
     const hasPersistedPin = this.#sessionsById.has(persistedSessionId);
@@ -1236,8 +1506,8 @@ export class ClaudeReadonlyBridge {
     };
   }
 
-  getProviderInfo() {
-    const currentModel = this.#getCurrentModelSelection();
+  getProviderInfo(sessionId = this.#pinnedSessionId) {
+    const currentModel = this.#getCurrentModelSelection(sessionId);
     return {
       capabilities: {
         discoverSessions: true,
@@ -1285,7 +1555,9 @@ export class ClaudeReadonlyBridge {
 
   async discoverSessions() {
     await this.#refreshSessions();
-    return this.#sessions.map((session) => this.#toPublicSession(session));
+    return this.#sessions
+      .filter((session) => !isDeepSeekSafeForkSession(session))
+      .map((session) => this.#toPublicSession(session));
   }
 
   getFailureModes() {
@@ -1301,14 +1573,14 @@ export class ClaudeReadonlyBridge {
     return this.#auditTrail.slice(-safeLimit).reverse().map((entry) => ({ ...entry }));
   }
 
-  getExecutionPolicy() {
+  getExecutionPolicy(sessionId = this.#pinnedSessionId) {
     return {
       cliArgs: [],
       displayName: this.#sendReadiness.sendReady ? "Claude Lab Send" : "Claude Readiness Gated",
       profile: this.#sendReadiness.sendReady ? "claude-lab-send" : "readonly",
       source: "provider",
       summary: this.#sendReadiness.sendReady
-        ? `Claude send is enabled with ${this.#getCurrentModelSelection().label}. Use /model or the page model switcher to change models.`
+        ? `Claude send is enabled with ${this.#getCurrentModelSelection(sessionId).label}. Use /model or the page model switcher to change models.`
         : this.#sendReadiness.reason,
       trustBoundary: this.#sendReadiness.sendReady ? "local-lab-claude-send" : "local-readonly",
     };
@@ -1321,23 +1593,38 @@ export class ClaudeReadonlyBridge {
       throw new BridgeError(400, "Model name is required.", "INVALID_MODEL");
     }
 
-    const previousSelection = this.#getCurrentModelSelection();
-    this.#modelSelection = nextSelection;
+    const sessionId = trimText(request.sessionId) || this.#pinnedSessionId;
+    const previousSelection = this.#getCurrentModelSelection(sessionId);
+    if (sessionId) {
+      this.#modelSelectionsBySession.set(sessionId, nextSelection);
+    } else {
+      this.#modelSelection = nextSelection;
+    }
+    if (previousSelection.provider && nextSelection.provider && previousSelection.provider !== nextSelection.provider) {
+      this.#pendingProviderBridgesBySession.set(sessionId, {
+        createdAt: nowIso(),
+        fromModel: previousSelection.model,
+        fromProvider: previousSelection.provider,
+        sessionId,
+        toModel: nextSelection.model,
+        toProvider: nextSelection.provider,
+      });
+    }
     await this.#persistPinnedSessionId();
     this.#recordAudit({
       action: "model_switch",
       detail: `Model switched from ${previousSelection.provider}:${previousSelection.model} to ${nextSelection.provider}:${nextSelection.model}.`,
-      nextSessionId: this.#pinnedSessionId,
-      prevSessionId: this.#pinnedSessionId,
+      nextSessionId: sessionId,
+      prevSessionId: sessionId,
     });
 
 	    if (this.#sendRequested) {
 	      await this.#refreshReadiness();
 	    }
 
-	    const executionState = this.#executionStateBySession.get(this.#pinnedSessionId);
+	    const executionState = this.#executionStateBySession.get(sessionId);
 	    if (executionState && executionState.phase !== "starting" && executionState.phase !== "running" && executionState.phase !== "stopping") {
-	      this.#setExecutionState(this.#pinnedSessionId, {
+	      this.#setExecutionState(sessionId, {
 	        acceptedAt: null,
 	        actualModel: null,
 	        exitCode: null,
@@ -1356,10 +1643,10 @@ export class ClaudeReadonlyBridge {
 	      }, { emit: false });
 	    }
 
-	    this.#emit("state", this.getBinding());
+	    this.#emit("state", this.getBinding(sessionId));
 	    return {
-      model: this.getProviderInfo().model,
-      provider: this.getProviderInfo(),
+      model: this.getProviderInfo(sessionId).model,
+      provider: this.getProviderInfo(sessionId),
     };
   }
 
@@ -1384,11 +1671,11 @@ export class ClaudeReadonlyBridge {
       phase: "idle",
       pid: null,
       processAlive: false,
-      selectedModel: this.#getCurrentModelSelection(),
+      selectedModel: this.#getCurrentModelSelection(sessionId),
       sessionId: sessionId || null,
       startedAt: null,
       statusDetail: this.#sendReadiness.sendReady
-        ? `Claude lab send is ready. 当前模型：${this.#getCurrentModelSelection().label}。`
+        ? `Claude lab send is ready. 当前模型：${this.#getCurrentModelSelection(sessionId).label}。`
         : `Claude send unavailable: ${this.#sendReadiness.reason}`,
       updatedAt: nowIso(),
     };
@@ -1445,6 +1732,33 @@ export class ClaudeReadonlyBridge {
     this.#clearRunTimers(runContext);
     this.#activeSendRuns.delete(sessionId);
     this.#sendingSessionIds.delete(sessionId);
+    if (runContext?.logicalSessionId && runContext.logicalSessionId !== sessionId) {
+      this.#sendingSessionIds.delete(runContext.logicalSessionId);
+      this.#sessionRunAliases.delete(runContext.logicalSessionId);
+      this.#ephemeralSessionsById.delete(sessionId);
+    }
+  }
+
+  async #finishRunAfterFinalPoll(session, runContext) {
+    try {
+      await this.#pollSession(session);
+    } catch (error) {
+      process.stderr.write(`Failed to poll final Claude transcript output: ${String(error)}\n`);
+    } finally {
+      this.#finishRun(session.id, runContext);
+    }
+  }
+
+  #getLogicalSession(session, runContext) {
+    if (runContext?.logicalSessionId) {
+      return this.#getSession(runContext.logicalSessionId) || session;
+    }
+    return session;
+  }
+
+  #setRunExecutionState(session, runContext, patch, options) {
+    const logicalSession = this.#getLogicalSession(session, runContext);
+    return this.#setExecutionState(logicalSession.id, patch, options);
   }
 
   #requestRunStop(session, runContext, { detail, phase = "stopping", status = "stopping" } = {}) {
@@ -1453,8 +1767,9 @@ export class ClaudeReadonlyBridge {
     }
 
     const message = trimText(detail) || "停止请求已发出，等待 Claude 进程退出。";
+    const logicalSession = this.#getLogicalSession(session, runContext);
     runContext.stopRequested = true;
-    this.#setExecutionState(session.id, {
+    this.#setRunExecutionState(session, runContext, {
       lastActivityAt: nowIso(),
       phase,
       pid: runContext.child.pid || null,
@@ -1463,7 +1778,7 @@ export class ClaudeReadonlyBridge {
     }, { emit: false });
     this.#emit("stop", {
       message,
-      sessionId: session.id,
+      sessionId: logicalSession.id,
       status,
       time: nowIso(),
     });
@@ -1474,11 +1789,11 @@ export class ClaudeReadonlyBridge {
       runContext.stopRequested = false;
       this.#emit("stop", {
         message: "停止失败：无法向 Claude 进程发送中断信号。",
-        sessionId: session.id,
+        sessionId: logicalSession.id,
         status: "stop-failed",
         time: nowIso(),
       });
-      this.#setExecutionState(session.id, {
+      this.#setRunExecutionState(session, runContext, {
         lastActivityAt: nowIso(),
         phase: "failed",
         pid: runContext.child.pid || null,
@@ -1543,10 +1858,11 @@ export class ClaudeReadonlyBridge {
     runContext.stallWatchdogTimer.unref?.();
   }
 
-  getBinding() {
-    const session = this.#getSession(this.#pinnedSessionId);
-    const executionState = this.#getExecutionState(this.#pinnedSessionId);
-    const isSending = this.#sendingSessionIds.has(this.#pinnedSessionId);
+  getBinding(sessionId = this.#pinnedSessionId) {
+    const effectiveSessionId = trimText(sessionId) || this.#pinnedSessionId;
+    const session = this.#getSession(effectiveSessionId);
+    const executionState = this.#getExecutionState(effectiveSessionId);
+    const isSending = this.#sendingSessionIds.has(effectiveSessionId);
     const send = !this.#sendReadiness.sendReady
       ? "disabled"
       : executionState?.phase === "failed"
@@ -1559,10 +1875,10 @@ export class ClaudeReadonlyBridge {
     return {
       attach: session ? "attached" : "error",
       connection: "connected",
-      execution: this.getExecutionPolicy(),
+      execution: this.getExecutionPolicy(effectiveSessionId),
       executionState,
-      pinnedSessionId: this.#pinnedSessionId,
-      provider: this.getProviderInfo(),
+      pinnedSessionId: effectiveSessionId,
+      provider: this.getProviderInfo(effectiveSessionId),
       send,
       session: session ? this.#toPublicSession(session) : null,
       stream: "streaming",
@@ -1595,8 +1911,10 @@ export class ClaudeReadonlyBridge {
     }
     const { cursor, transcript } = parsedTranscript;
     this.#sessionCursors.set(sessionId, cursor);
-    this.#transcriptCache.set(sessionId, transcript);
-    return transcript.map((entry) => ({ ...entry }));
+    const logicalEntries = await this.#readLogicalTranscript(sessionId);
+    const mergedTranscript = mergeTranscriptEntries(transcript, logicalEntries);
+    this.#transcriptCache.set(sessionId, mergedTranscript);
+    return mergedTranscript.map((entry) => ({ ...entry }));
   }
 
   async getTranscriptSnapshot({ afterId = "", forceFull = false, sessionId = this.#pinnedSessionId } = {}) {
@@ -1648,7 +1966,7 @@ export class ClaudeReadonlyBridge {
     };
   }
 
-  async attachSession(sessionId, explicit) {
+  async attachSession(sessionId, explicit, options = {}) {
     if (explicit !== true) {
       throw new BridgeError(
         400,
@@ -1664,8 +1982,10 @@ export class ClaudeReadonlyBridge {
     }
 
     const previousPinnedSessionId = this.#pinnedSessionId;
-    this.#pinnedSessionId = target.id;
-    await this.#persistPinnedSessionId();
+    if (options.persist !== false) {
+      this.#pinnedSessionId = target.id;
+      await this.#persistPinnedSessionId();
+    }
     this.#recordAudit({
       action: "session_switch",
       detail: "User explicitly switched the pinned local Claude readonly session.",
@@ -1677,12 +1997,13 @@ export class ClaudeReadonlyBridge {
       session: this.#toPublicSession(target),
       updatedAt: nowIso(),
     });
-    this.#emit("state", this.getBinding());
+    this.#emit("state", this.getBinding(target.id));
 
-    return this.getBinding();
+    return this.getBinding(target.id);
   }
 
   async sendInput(message, options = {}) {
+    const requestedSessionId = trimText(options?.sessionId) || this.#pinnedSessionId;
     const trimmed = trimText(message);
     const imagePaths = Array.isArray(options?.imagePaths)
       ? options.imagePaths.map((filePath) => normalizePath(filePath)).filter(Boolean)
@@ -1692,18 +2013,18 @@ export class ClaudeReadonlyBridge {
     if (modelCommand) {
       if (!modelCommand.requested) {
         return {
-          message: formatModelList(this.#modelCatalog, this.#getCurrentModelSelection()),
-          model: this.getProviderInfo().model,
+          message: formatModelList(this.#modelCatalog, this.#getCurrentModelSelection(requestedSessionId)),
+          model: this.getProviderInfo(requestedSessionId).model,
           modelCommand: true,
-          sessionId: this.#pinnedSessionId,
+          sessionId: requestedSessionId,
         };
       }
-      const result = await this.setModelSelection({ model: modelCommand.requested });
+      const result = await this.setModelSelection({ model: modelCommand.requested, sessionId: requestedSessionId });
       return {
         message: `模型已切换为 ${result.model.current.model} (${result.model.current.provider})。`,
         model: result.model,
         modelCommand: true,
-        sessionId: this.#pinnedSessionId,
+        sessionId: requestedSessionId,
       };
     }
 
@@ -1712,7 +2033,7 @@ export class ClaudeReadonlyBridge {
     }
 
     await this.#refreshSessions(true);
-    const session = this.#getSession(this.#pinnedSessionId);
+    const session = this.#getSession(requestedSessionId);
     if (!session) {
       throw new BridgeError(409, "Pinned session is not attached.", "SESSION_ATTACH_ERROR");
     }
@@ -1729,10 +2050,17 @@ export class ClaudeReadonlyBridge {
       throw new BridgeError(409, "Pinned session is still processing the previous instruction.", "SEND_IN_PROGRESS");
     }
 
-    const target = await this.#prepareSessionForCurrentModel(session, trimmed);
+    const pendingBridge = this.#pendingProviderBridgesBySession.get(session.id)?.sessionId === session.id
+      ? { ...this.#pendingProviderBridgesBySession.get(session.id) }
+      : null;
+    const target = await this.#prepareSessionForCurrentModel(session, trimmed, { providerBridge: pendingBridge });
 
-    this.#sendingSessionIds.add(target.session.id);
-    this.#setExecutionState(target.session.id, {
+    const logicalSession = target.logicalSession || target.session;
+    this.#sendingSessionIds.add(logicalSession.id);
+    if (target.session.id !== logicalSession.id) {
+      this.#sessionRunAliases.set(logicalSession.id, target.session.id);
+    }
+    this.#setExecutionState(logicalSession.id, {
       acceptedAt: null,
       exitCode: null,
       lastActivityAt: nowIso(),
@@ -1743,37 +2071,66 @@ export class ClaudeReadonlyBridge {
       phase: "starting",
       pid: null,
       processAlive: false,
-      selectedModel: this.#getCurrentModelSelection(),
+      selectedModel: this.#getCurrentModelSelection(logicalSession.id),
       startedAt: nowIso(),
       statusDetail: target.forked
         ? `原 session 含 Claude thinking 历史，已创建 DeepSeek 安全分支 ${target.session.id.slice(0, 8)}，正在带入最近上下文执行。`
-        : imagePaths.length > 0
+        : target.providerBridgeApplied
+          ? `检测到 provider 从 ${pendingBridge.fromProvider} 切到 ${pendingBridge.toProvider}，已带入最近上下文恢复包，正在启动 Claude resume。`
+          : imagePaths.length > 0
           ? `指令已发送，已附加 ${String(imagePaths.length)} 张图片，正在启动 Claude resume。`
           : "指令已发送，正在启动 Claude resume。",
     }, { emit: false });
-    this.#emit("state", this.getBinding());
+    this.#emit("state", this.getBinding(logicalSession.id));
 
     try {
       const result = await this.#startSendProcess(target.session, target.prompt, {
         imageAnalyses,
         imagePaths,
+        logicalSession,
         resume: !target.forked,
       });
+      if (target.session.id !== logicalSession.id) {
+        await this.#pollSession(target.session);
+      }
+      if (target.deepSeekRun?.initializing) {
+        await this.#markDeepSeekRunReady(logicalSession.id, target.session.id);
+      }
+      if (target.providerBridgeApplied && this.#pendingProviderBridgesBySession.get(logicalSession.id)?.sessionId === logicalSession.id) {
+        this.#pendingProviderBridgesBySession.delete(logicalSession.id);
+      }
+      if (target.session.id !== logicalSession.id) {
+        const logicalUserEntryId = `${logicalSession.id}:logical-user:${target.session.id}`;
+        await this.#appendLogicalTranscriptEntry(logicalSession.id, {
+          id: logicalUserEntryId,
+          role: "user",
+          text: trimmed,
+          time: result.acceptedAt || nowIso(),
+        });
+        await this.#advanceDeepSeekRunSyncedEntry(logicalSession.id, target.session.id, logicalUserEntryId);
+      }
       return {
         ...result,
         acceptedAt: nowIso(),
         forked: target.forked,
         imageCount: imagePaths.length,
+        providerBridgeApplied: Boolean(target.providerBridgeApplied),
+        reusedDeepSeekRun: Boolean(target.reusedDeepSeekRun),
       };
     } catch (error) {
-      this.#sendingSessionIds.delete(target.session.id);
-      this.#emit("state", this.getBinding());
+      if (target.deepSeekRun?.initializing) {
+        await this.#markDeepSeekRunFailed(logicalSession.id, target.session.id, "failed");
+      }
+      this.#sendingSessionIds.delete(logicalSession.id);
+      this.#sessionRunAliases.delete(logicalSession.id);
+      this.#emit("state", this.getBinding(logicalSession.id));
       throw error;
     }
   }
 
-  async stopInput() {
-    const session = this.#getSession(this.#pinnedSessionId);
+  async stopInput(options = {}) {
+    const requestedSessionId = trimText(options?.sessionId) || this.#pinnedSessionId;
+    const session = this.#getSession(requestedSessionId);
     if (!session) {
       throw new BridgeError(409, "Pinned session is not attached.", "SESSION_ATTACH_ERROR");
     }
@@ -1790,12 +2147,14 @@ export class ClaudeReadonlyBridge {
       };
     }
 
-    const runContext = this.#activeSendRuns.get(session.id);
+    const runSessionId = this.#sessionRunAliases.get(session.id) || session.id;
+    const runSession = this.#getSession(runSessionId) || this.#ephemeralSessionsById.get(runSessionId) || session;
+    const runContext = this.#activeSendRuns.get(runSession.id);
     if (!runContext?.child) {
       throw new BridgeError(409, "Claude execution process is missing.", "STOP_FAILED");
     }
 
-    const signaled = this.#requestRunStop(session, runContext, {
+    const signaled = this.#requestRunStop(runSession, runContext, {
       detail: "停止请求已发出，等待 Claude 进程退出。",
     });
     if (!signaled) {
@@ -1810,26 +2169,78 @@ export class ClaudeReadonlyBridge {
     };
   }
 
-  async #prepareSessionForCurrentModel(session, prompt) {
-    const currentModel = this.#getCurrentModelSelection();
+  async #prepareSessionForCurrentModel(session, prompt, { providerBridge = null } = {}) {
+    const currentModel = this.#getCurrentModelSelection(session.id);
+    const withProviderBridge = async () => {
+      if (!providerBridge || providerBridge.toProvider !== currentModel.provider) {
+        return {
+          applied: false,
+          prompt,
+        };
+      }
+      const transcript = await this.getTranscript(session.id);
+      const bridgedPrompt = buildProviderSwitchBridgePrompt({
+        bridge: providerBridge,
+        prompt,
+        selection: currentModel,
+        transcript,
+      });
+      return {
+        applied: bridgedPrompt !== prompt,
+        prompt: bridgedPrompt,
+      };
+    };
+
     if (currentModel.provider !== "deepseek") {
+      const bridged = await withProviderBridge();
       return {
         forked: false,
-        prompt,
+        prompt: bridged.prompt,
+        providerBridgeApplied: bridged.applied,
         session,
       };
     }
 
     const thinkingState = await inspectClaudeSessionThinking(session.filePath);
     if (!thinkingState.hasThinking) {
+      const bridged = await withProviderBridge();
       return {
         forked: false,
-        prompt,
+        prompt: bridged.prompt,
+        providerBridgeApplied: bridged.applied,
         session,
       };
     }
 
     const transcript = await this.getTranscript(session.id);
+    const reusableDeepSeekRun = await this.#getReusableDeepSeekRun(session.id, transcript);
+    if (reusableDeepSeekRun) {
+      const reusedSession = {
+        filePath: reusableDeepSeekRun.filePath,
+        id: reusableDeepSeekRun.sessionId,
+        name: `DeepSeek 安全分支 · ${session.name}`,
+        projectPath: session.projectPath,
+        resumePath: session.resumePath,
+        updatedAt: nowIso(),
+      };
+      this.#ephemeralSessionsById.set(reusedSession.id, reusedSession);
+      this.#sessionsById.set(reusedSession.id, reusedSession);
+      this.#recordAudit({
+        action: "deepseek_safe_reuse",
+        detail: `DeepSeek 继续沿用安全分支 ${reusedSession.id.slice(0, 8)}，未重复注入上下文恢复包。`,
+        nextSessionId: reusedSession.id,
+        prevSessionId: session.id,
+      });
+      return {
+        forked: false,
+        logicalSession: session,
+        prompt,
+        providerBridgeApplied: false,
+        reusedDeepSeekRun: true,
+        session: reusedSession,
+      };
+    }
+
     const nextSessionId = randomUUID();
     const nextSession = {
       filePath: path.join(path.dirname(session.filePath), `${nextSessionId}.jsonl`),
@@ -1839,6 +2250,13 @@ export class ClaudeReadonlyBridge {
       resumePath: session.resumePath,
       updatedAt: nowIso(),
     };
+    this.#ephemeralSessionsById.set(nextSession.id, nextSession);
+    await this.#setDeepSeekRunInitializing(session.id, {
+      filePath: nextSession.filePath,
+      lastSyncedLogicalEntryId: transcript.at(-1)?.id || null,
+      sessionId: nextSession.id,
+      sourcePhysicalSessionId: session.id,
+    });
     const forkPrompt = buildDeepSeekSafeForkPrompt({
       latestPrompt: prompt,
       sourceSessionId: session.id,
@@ -1846,10 +2264,7 @@ export class ClaudeReadonlyBridge {
     });
     const detail = `原 session 含 Claude thinking 历史，已自动创建 DeepSeek 安全分支 ${nextSession.id.slice(0, 8)}，并带入最近 ${String(Math.min(transcript.length, DEEPSEEK_FORK_CONTEXT_LIMIT))} 条可见上下文继续执行。`;
 
-    this.#pinnedSessionId = nextSession.id;
-    this.#sessions = [nextSession, ...this.#sessions];
     this.#sessionsById.set(nextSession.id, nextSession);
-    await this.#persistPinnedSessionId();
     this.#recordAudit({
       action: "deepseek_safe_fork",
       detail,
@@ -1875,7 +2290,10 @@ export class ClaudeReadonlyBridge {
 
     return {
       forked: true,
+      deepSeekRun: { initializing: true },
+      logicalSession: session,
       prompt: forkPrompt,
+      providerBridgeApplied: false,
       session: nextSession,
     };
   }
@@ -1911,7 +2329,14 @@ export class ClaudeReadonlyBridge {
     );
   }
 
-  #getCurrentModelSelection() {
+  #getCurrentModelSelection(sessionId = this.#pinnedSessionId) {
+    const effectiveSessionId = trimText(sessionId);
+    if (effectiveSessionId) {
+      const sessionSelection = this.#modelSelectionsBySession.get(effectiveSessionId);
+      if (sessionSelection) {
+        return sessionSelection;
+      }
+    }
     if (!this.#modelSelection) {
       this.#modelSelection = this.#resolveInitialModelSelection(null);
     }
@@ -1990,7 +2415,7 @@ export class ClaudeReadonlyBridge {
         args,
         binaryPath: this.#claudeBinaryPath,
         cwd: tempDir,
-        env: createClaudeExecutionEnv(currentModel),
+        env: createClaudeExecutionEnv(currentModel, tempDir),
         timeoutMs: SEND_PROBE_TIMEOUT_MS,
       });
 
@@ -2037,12 +2462,14 @@ export class ClaudeReadonlyBridge {
     }
   }
 
-  async #startSendProcess(session, prompt, { imageAnalyses = [], imagePaths = [], resume = true } = {}) {
+  async #startSendProcess(session, prompt, { imageAnalyses = [], imagePaths = [], logicalSession = null, resume = true } = {}) {
     let accepted = false;
     let timeoutId = null;
+    const requestedCwd = session.resumePath || session.projectPath;
+    const recentReadableDirs = await inferRecentTranscriptReadableDirs(session);
 
     return new Promise((resolve, reject) => {
-      const currentModel = this.#getCurrentModelSelection();
+      const currentModel = this.#getCurrentModelSelection(logicalSession?.id || session.id);
       const imageMode = currentModel.provider === "deepseek" ? "ocr" : "native";
       const promptWithImages = buildClaudePromptWithImages(prompt, imagePaths, {
         imageAnalyses,
@@ -2050,6 +2477,7 @@ export class ClaudeReadonlyBridge {
       });
       const readableDirs = Array.from(new Set([
         session.projectPath,
+        ...recentReadableDirs,
         ...imagePaths.map((filePath) => path.dirname(filePath)).filter(Boolean),
       ]));
       const args = [
@@ -2074,8 +2502,8 @@ export class ClaudeReadonlyBridge {
         this.#claudeBinaryPath,
         args,
         {
-          cwd: session.resumePath || session.projectPath,
-          env: createClaudeExecutionEnv(currentModel),
+          cwd: requestedCwd,
+          env: createClaudeExecutionEnv(currentModel, requestedCwd),
           stdio: ["pipe", "pipe", "pipe"],
         },
       );
@@ -2084,20 +2512,21 @@ export class ClaudeReadonlyBridge {
         child,
         lastVisibleMessageAt: null,
         lastToolActivity: null,
+        logicalSessionId: logicalSession?.id || session.id,
         startedAt: nowIso(),
         stallWatchdogTimer: null,
         stopEscalationTimer: null,
         stopRequested: false,
       };
       this.#activeSendRuns.set(session.id, runContext);
-      this.#setExecutionState(session.id, {
+      this.#setRunExecutionState(session, runContext, {
         lastActivityAt: nowIso(),
         phase: "starting",
         pid: child.pid || null,
         processAlive: true,
         statusDetail: child.pid
-          ? `Claude 执行进程已启动（PID ${String(child.pid)}），模型 ${currentModel.model}，${imagePaths.length > 0 ? `已附加 ${String(imagePaths.length)} 张图片，` : ""}等待确认接收。`
-          : `Claude 执行进程已启动，模型 ${currentModel.model}，${imagePaths.length > 0 ? `已附加 ${String(imagePaths.length)} 张图片，` : ""}等待确认接收。`,
+          ? `Claude 执行进程已启动（PID ${String(child.pid)}），模型 ${currentModel.model}，${recentReadableDirs.length > 0 ? `已补充 ${String(recentReadableDirs.length)} 个近期工作区授权，` : ""}${imagePaths.length > 0 ? `已附加 ${String(imagePaths.length)} 张图片，` : ""}等待确认接收。`
+          : `Claude 执行进程已启动，模型 ${currentModel.model}，${recentReadableDirs.length > 0 ? `已补充 ${String(recentReadableDirs.length)} 个近期工作区授权，` : ""}${imagePaths.length > 0 ? `已附加 ${String(imagePaths.length)} 张图片，` : ""}等待确认接收。`,
       }, { emit: false });
       this.#emit("state", this.getBinding());
       this.#startRunWatchdog(session, runContext);
@@ -2109,7 +2538,7 @@ export class ClaudeReadonlyBridge {
 
         accepted = true;
         runContext.acceptedAt = nowIso();
-        this.#setExecutionState(session.id, {
+        this.#setRunExecutionState(session, runContext, {
           acceptedAt: runContext.acceptedAt,
           lastActivityAt: nowIso(),
           phase: runContext.stopRequested ? "stopping" : "running",
@@ -2122,7 +2551,7 @@ export class ClaudeReadonlyBridge {
               : "指令已被 Claude 接收，等待输出进入信息流。",
         }, { emit: false });
         this.#emit("state", this.getBinding());
-        resolve({ imageCount: imagePaths.length, sessionId: session.id });
+        resolve({ imageCount: imagePaths.length, sessionId: runContext.logicalSessionId });
       };
 
       const fail = (message) => {
@@ -2133,7 +2562,7 @@ export class ClaudeReadonlyBridge {
           return;
         }
 
-        this.#setExecutionState(session.id, {
+        this.#setRunExecutionState(session, runContext, {
           lastActivityAt: nowIso(),
           phase: "failed",
           pid: child.pid || null,
@@ -2143,7 +2572,7 @@ export class ClaudeReadonlyBridge {
         this.#emit("state", this.getBinding());
 
         if (accepted) {
-          this.#emit("sendFailure", { message, sessionId: session.id, time: nowIso() });
+          this.#emit("sendFailure", { message, sessionId: runContext.logicalSessionId, time: nowIso() });
           return;
         }
 
@@ -2167,7 +2596,7 @@ export class ClaudeReadonlyBridge {
         }
 
         modelEvidence = evidence;
-        this.#setExecutionState(session.id, {
+        this.#setRunExecutionState(session, runContext, {
           actualModel: evidence.actualModel || null,
           lastActivityAt: nowIso(),
           modelUsage: evidence.modelUsage,
@@ -2199,7 +2628,7 @@ export class ClaudeReadonlyBridge {
             recordModelEvidence(parsed);
           }
         }
-        this.#setExecutionState(session.id, {
+        this.#setRunExecutionState(session, runContext, {
           lastActivityAt: nowIso(),
           phase: accepted ? (runContext.stopRequested ? "stopping" : "running") : "starting",
           pid: child.pid || null,
@@ -2217,7 +2646,7 @@ export class ClaudeReadonlyBridge {
 
       child.stderr.on("data", (chunk) => {
         stderrText += chunk.toString("utf-8");
-        this.#setExecutionState(session.id, {
+        this.#setRunExecutionState(session, runContext, {
           lastActivityAt: nowIso(),
           phase: accepted ? (runContext.stopRequested ? "stopping" : "running") : "starting",
           pid: child.pid || null,
@@ -2229,7 +2658,7 @@ export class ClaudeReadonlyBridge {
 
       child.on("close", (code) => {
         clearTimeout(timeoutId);
-        this.#finishRun(session.id, runContext);
+        void this.#finishRunAfterFinalPoll(session, runContext);
         const trailingRecord = safeJsonParse(streamRemainder);
         if (trailingRecord) {
           recordModelEvidence(trailingRecord);
@@ -2244,7 +2673,7 @@ export class ClaudeReadonlyBridge {
 
         if (runContext.stopRequested) {
           const detail = code === 0 ? "Claude 执行已停止。" : `Claude 执行已停止（退出码 ${String(code)}）。`;
-          this.#setExecutionState(session.id, {
+          this.#setRunExecutionState(session, runContext, {
             actualModel: modelEvidence?.actualModel || null,
             exitCode: code,
             lastActivityAt: nowIso(),
@@ -2258,7 +2687,7 @@ export class ClaudeReadonlyBridge {
           }, { emit: false });
           this.#emit("stop", {
             message: detail,
-            sessionId: session.id,
+            sessionId: runContext.logicalSessionId,
             status: "stopped",
             time: nowIso(),
           });
@@ -2270,7 +2699,7 @@ export class ClaudeReadonlyBridge {
         }
 
         if (code === 0) {
-          this.#setExecutionState(session.id, {
+          this.#setRunExecutionState(session, runContext, {
             actualModel: modelEvidence?.actualModel || null,
             exitCode: 0,
             lastActivityAt: nowIso(),
@@ -2343,7 +2772,7 @@ export class ClaudeReadonlyBridge {
 
     this.#pollTimer = setInterval(() => {
       this.#scheduleReadinessRetry();
-      void this.#pollPinnedSession();
+      void this.#pollActiveSessions();
     }, SESSION_POLL_INTERVAL_MS);
     this.#pollTimer.unref?.();
   }
@@ -2366,18 +2795,45 @@ export class ClaudeReadonlyBridge {
     this.#readinessRetryTimer.unref?.();
   }
 
-  async #pollPinnedSession() {
-    const session = this.#getSession(this.#pinnedSessionId);
+  async #pollActiveSessions() {
+    const sessions = [];
+    const pinned = this.#getSession(this.#pinnedSessionId);
+    if (pinned) {
+      sessions.push(pinned);
+    }
+    for (const session of this.#ephemeralSessionsById.values()) {
+      sessions.push(session);
+    }
+
+    for (const session of sessions) {
+      await this.#pollSession(session);
+    }
+  }
+
+  async #pollSession(session) {
     if (!session || !session.filePath) {
       return;
     }
 
+    const runContext = this.#activeSendRuns.get(session.id);
+    const logicalSession = this.#getLogicalSession(session, runContext);
+    const outputSessionId = logicalSession.id;
     let cursor = this.#sessionCursors.get(session.id);
     if (!cursor) {
-      await this.getTranscript(session.id);
-      cursor = this.#sessionCursors.get(session.id);
-      if (!cursor) {
-        return;
+      if (runContext?.logicalSessionId && runContext.logicalSessionId !== session.id) {
+        cursor = {
+          emittedIds: new Set(),
+          nextLineNumber: 1,
+          offset: 0,
+          remainder: "",
+        };
+        this.#sessionCursors.set(session.id, cursor);
+      } else {
+        await this.getTranscript(session.id);
+        cursor = this.#sessionCursors.get(session.id);
+        if (!cursor) {
+          return;
+        }
       }
     }
 
@@ -2406,7 +2862,7 @@ export class ClaudeReadonlyBridge {
     const lines = combined.split("\n");
     cursor.remainder = lines.pop() ?? "";
 
-    const transcript = this.#transcriptCache.get(session.id) || [];
+    const transcript = this.#transcriptCache.get(outputSessionId) || [];
     for (const line of lines) {
       if (!line.trim()) {
         continue;
@@ -2419,20 +2875,23 @@ export class ClaudeReadonlyBridge {
         continue;
       }
 
-      const entry = normalizeClaudeRecord(session.id, record, lineNumber);
+      const entry = normalizeClaudeRecord(outputSessionId, record, lineNumber);
       if (!entry || cursor.emittedIds.has(entry.id)) {
         continue;
       }
 
       cursor.emittedIds.add(entry.id);
       transcript.push(entry);
+      if (outputSessionId !== session.id) {
+        await this.#appendLogicalTranscriptEntry(outputSessionId, entry);
+        await this.#advanceDeepSeekRunSyncedEntry(outputSessionId, session.id, entry.id);
+      }
       if (transcript.length > DEFAULT_TRANSCRIPT_LIMIT) {
         transcript.splice(0, transcript.length - DEFAULT_TRANSCRIPT_LIMIT);
       }
-      const executionState = this.#executionStateBySession.get(session.id);
+      const executionState = this.#executionStateBySession.get(outputSessionId);
       if (executionState && (executionState.phase === "starting" || executionState.phase === "running")) {
         const visibleAt = entry.time || nowIso();
-        const runContext = this.#activeSendRuns.get(session.id);
         const toolActivity = entry.toolActivity
           ? {
               detail: entry.toolActivity.detail || "",
@@ -2449,7 +2908,7 @@ export class ClaudeReadonlyBridge {
             runContext.lastVisibleMessageAt = visibleAt;
           }
         }
-        this.#setExecutionState(session.id, {
+        this.#setExecutionState(outputSessionId, {
           lastActivityAt: visibleAt,
           lastToolActivity: toolActivity || executionState.lastToolActivity || null,
           lastVisibleMessageAt: toolActivity ? executionState.lastVisibleMessageAt || null : visibleAt,
@@ -2460,11 +2919,11 @@ export class ClaudeReadonlyBridge {
             : "Claude 执行中，已收到新的可见输出。",
         }, { emit: false });
       }
-      this.#emit("message", { entry, sessionId: session.id });
+      this.#emit("message", { entry, sessionId: outputSessionId });
     }
 
     cursor.offset = fileInfo.size;
-    this.#transcriptCache.set(session.id, transcript);
+    this.#transcriptCache.set(outputSessionId, transcript);
   }
 
   #emit(type, payload) {
@@ -2492,7 +2951,7 @@ export class ClaudeReadonlyBridge {
       return null;
     }
 
-    return this.#sessionsById.get(sessionId) || null;
+    return this.#sessionsById.get(sessionId) || this.#ephemeralSessionsById.get(sessionId) || null;
   }
 
   #toPublicSession(session) {
@@ -2505,6 +2964,178 @@ export class ClaudeReadonlyBridge {
     };
   }
 
+  #getProviderRunSessionState(logicalSessionId) {
+    if (!logicalSessionId) {
+      return null;
+    }
+    const sessions = this.#providerRuns.sessions && typeof this.#providerRuns.sessions === "object"
+      ? this.#providerRuns.sessions
+      : {};
+    return sessions[logicalSessionId] && typeof sessions[logicalSessionId] === "object"
+      ? sessions[logicalSessionId]
+      : null;
+  }
+
+  #getDeepSeekRun(logicalSessionId) {
+    const sessionState = this.#getProviderRunSessionState(logicalSessionId);
+    const run = sessionState?.providers?.deepseek;
+    return run && typeof run === "object" ? run : null;
+  }
+
+  async #getReusableDeepSeekRun(logicalSessionId, transcript) {
+    const run = this.#getDeepSeekRun(logicalSessionId);
+    if (!run || run.status !== "ready" || !trimText(run.sessionId) || !trimText(run.filePath)) {
+      return null;
+    }
+
+    try {
+      await stat(run.filePath);
+    } catch {
+      return null;
+    }
+
+    const latestEntryId = Array.isArray(transcript) ? transcript.at(-1)?.id || null : null;
+    if (latestEntryId && run.lastSyncedLogicalEntryId && latestEntryId !== run.lastSyncedLogicalEntryId) {
+      return null;
+    }
+
+    return {
+      ...run,
+      filePath: run.filePath,
+      sessionId: run.sessionId,
+    };
+  }
+
+  async #setDeepSeekRunInitializing(logicalSessionId, { filePath, lastSyncedLogicalEntryId, sessionId, sourcePhysicalSessionId }) {
+    if (!logicalSessionId || !sessionId) {
+      return;
+    }
+
+    const now = nowIso();
+    const sessions = this.#providerRuns.sessions && typeof this.#providerRuns.sessions === "object"
+      ? this.#providerRuns.sessions
+      : {};
+    const sessionState = sessions[logicalSessionId] && typeof sessions[logicalSessionId] === "object"
+      ? sessions[logicalSessionId]
+      : {};
+    const providers = sessionState.providers && typeof sessionState.providers === "object" ? sessionState.providers : {};
+    sessions[logicalSessionId] = {
+      ...sessionState,
+      activeProvider: "deepseek",
+      providers: {
+        ...providers,
+        deepseek: {
+          createdAt: providers.deepseek?.createdAt || now,
+          filePath,
+          lastSyncedLogicalEntryId: lastSyncedLogicalEntryId || null,
+          provider: "deepseek",
+          sessionId,
+          sourcePhysicalSessionId: sourcePhysicalSessionId || logicalSessionId,
+          status: "initializing",
+          updatedAt: now,
+        },
+      },
+    };
+    this.#providerRuns = { sessions, updatedAt: now };
+    await this.#persistProviderRuns();
+  }
+
+  async #markDeepSeekRunReady(logicalSessionId, sessionId) {
+    const run = this.#getDeepSeekRun(logicalSessionId);
+    if (!run || run.sessionId !== sessionId) {
+      return;
+    }
+
+    run.status = "ready";
+    run.updatedAt = nowIso();
+    await this.#persistProviderRuns();
+  }
+
+  async #markDeepSeekRunFailed(logicalSessionId, sessionId, status = "failed") {
+    const run = this.#getDeepSeekRun(logicalSessionId);
+    if (!run || run.sessionId !== sessionId) {
+      return;
+    }
+
+    run.status = status;
+    run.updatedAt = nowIso();
+    await this.#persistProviderRuns();
+  }
+
+  async #advanceDeepSeekRunSyncedEntry(logicalSessionId, sessionId, entryId) {
+    const run = this.#getDeepSeekRun(logicalSessionId);
+    if (!run || run.sessionId !== sessionId || !entryId) {
+      return;
+    }
+
+    run.lastSyncedLogicalEntryId = entryId;
+    run.updatedAt = nowIso();
+    await this.#persistProviderRuns();
+  }
+
+  #getLogicalTranscriptPath(sessionId) {
+    const safeSessionId = safeFileName(sessionId);
+    if (!safeSessionId) {
+      return "";
+    }
+    return path.join(this.#logicalTranscriptDir, `${safeSessionId}.jsonl`);
+  }
+
+  async #readLogicalTranscript(sessionId) {
+    const filePath = this.#getLogicalTranscriptPath(sessionId);
+    if (!filePath) {
+      return [];
+    }
+
+    let raw;
+    try {
+      raw = await readFile(filePath, "utf-8");
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        this.#logicalTranscriptPersistedIds.set(sessionId, new Set());
+        return [];
+      }
+      throw error;
+    }
+
+    const entries = [];
+    const persistedIds = new Set();
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) {
+        continue;
+      }
+      const entry = normalizeLogicalTranscriptEntry(safeJsonParse(line));
+      if (!entry || persistedIds.has(entry.id)) {
+        continue;
+      }
+      persistedIds.add(entry.id);
+      entries.push(entry);
+    }
+    this.#logicalTranscriptPersistedIds.set(sessionId, persistedIds);
+    return entries.slice(-DEFAULT_TRANSCRIPT_LIMIT);
+  }
+
+  async #appendLogicalTranscriptEntry(sessionId, entry) {
+    const normalized = normalizeLogicalTranscriptEntry(entry);
+    if (!sessionId || !normalized || isDeepSeekSafeForkScaffoldText(normalized.text)) {
+      return;
+    }
+
+    let persistedIds = this.#logicalTranscriptPersistedIds.get(sessionId);
+    if (!persistedIds) {
+      await this.#readLogicalTranscript(sessionId);
+      persistedIds = this.#logicalTranscriptPersistedIds.get(sessionId) || new Set();
+    }
+    if (persistedIds.has(normalized.id)) {
+      return;
+    }
+
+    persistedIds.add(normalized.id);
+    this.#logicalTranscriptPersistedIds.set(sessionId, persistedIds);
+    await mkdir(this.#logicalTranscriptDir, { recursive: true });
+    await appendFile(this.#getLogicalTranscriptPath(sessionId), `${JSON.stringify(normalized)}\n`, "utf-8");
+  }
+
   async #persistPinnedSessionId() {
     if (!this.#pinnedSessionId) {
       return;
@@ -2514,7 +3145,8 @@ export class ClaudeReadonlyBridge {
     await mkdir(dir, { recursive: true });
     const payload = JSON.stringify(
       {
-        modelSelection: this.#getCurrentModelSelection(),
+        modelSelection: this.#modelSelection || this.#resolveInitialModelSelection(null),
+        sessionModelSelections: Object.fromEntries(this.#modelSelectionsBySession.entries()),
         pinnedSessionId: this.#pinnedSessionId,
         providerId: "claude",
         updatedAt: nowIso(),
@@ -2538,6 +3170,31 @@ export class ClaudeReadonlyBridge {
     }
   }
 
+  async #persistProviderRuns() {
+    try {
+      await mkdir(path.dirname(this.#providerRunsFilePath), { recursive: true });
+      await writeFile(this.#providerRunsFilePath, JSON.stringify(this.#providerRuns, null, 2), "utf-8");
+    } catch (error) {
+      process.stderr.write(`Failed to persist Claude provider runs: ${String(error)}\n`);
+    }
+  }
+
+  async #readPersistedProviderRuns() {
+    try {
+      const parsed = JSON.parse(await readFile(this.#providerRunsFilePath, "utf-8"));
+      const sessions = parsed?.sessions && typeof parsed.sessions === "object" ? parsed.sessions : {};
+      this.#providerRuns = {
+        sessions,
+        updatedAt: trimText(parsed?.updatedAt) || null,
+      };
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+        process.stderr.write(`Failed to load Claude provider runs: ${String(error)}\n`);
+      }
+      this.#providerRuns = { sessions: {} };
+    }
+  }
+
   async #readPersistedState() {
     try {
       const raw = await readFile(this.#stateFilePath, "utf-8");
@@ -2546,6 +3203,9 @@ export class ClaudeReadonlyBridge {
         return {
           modelSelection: parsed.modelSelection && typeof parsed.modelSelection === "object" ? parsed.modelSelection : null,
           pinnedSessionId: typeof parsed.pinnedSessionId === "string" && parsed.pinnedSessionId ? parsed.pinnedSessionId : null,
+          sessionModelSelections: parsed.sessionModelSelections && typeof parsed.sessionModelSelections === "object"
+            ? parsed.sessionModelSelections
+            : {},
         };
       }
     } catch (error) {
@@ -2557,6 +3217,7 @@ export class ClaudeReadonlyBridge {
     return {
       modelSelection: null,
       pinnedSessionId: null,
+      sessionModelSelections: {},
     };
   }
 }

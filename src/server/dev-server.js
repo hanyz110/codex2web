@@ -27,6 +27,7 @@ const publicDir = fileURLToPath(new URL("./public/", import.meta.url));
 const auditFilePath = path.join(projectRoot, ".codex2web", "session-audit.jsonl");
 const claudeAuditFilePath = path.join(projectRoot, ".codex2web", "claude-session-audit.jsonl");
 const claudeStateFilePath = path.join(projectRoot, ".codex2web", "claude-session-pin.json");
+const clientSessionPinsFilePath = path.join(projectRoot, ".codex2web", "client-session-pins.json");
 const stateFilePath = path.join(projectRoot, ".codex2web", "session-pin.json");
 const uploadDir = path.join(projectRoot, ".codex2web", "uploads");
 const claudeImageOcrScriptPath = path.join(projectRoot, "scripts", "claude-image-ocr.swift");
@@ -133,6 +134,7 @@ const bridge =
         stateFilePath,
       });
 await bridge.init();
+const clientSessionPins = await readClientSessionPins();
 
 const contentTypeByExt = {
   ".css": "text/css; charset=utf-8",
@@ -180,6 +182,63 @@ function sendJson(res, statusCode, payload) {
     "content-type": "application/json; charset=utf-8",
   });
   res.end(JSON.stringify(payload));
+}
+
+function normalizeClientId(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return /^[a-zA-Z0-9._:-]{8,128}$/.test(trimmed) ? trimmed : "";
+}
+
+async function readClientSessionPins() {
+  try {
+    const parsed = JSON.parse(await readFile(clientSessionPinsFilePath, "utf-8"));
+    const pins = parsed?.clients && typeof parsed.clients === "object" ? parsed.clients : {};
+    return new Map(
+      Object.entries(pins)
+        .map(([clientId, sessionId]) => [normalizeClientId(clientId), typeof sessionId === "string" ? sessionId : ""])
+        .filter(([clientId, sessionId]) => clientId && sessionId),
+    );
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+      process.stderr.write(`Failed to load client session pins: ${String(error)}\n`);
+    }
+    return new Map();
+  }
+}
+
+async function persistClientSessionPins() {
+  try {
+    await mkdir(path.dirname(clientSessionPinsFilePath), { recursive: true });
+    await writeFile(
+      clientSessionPinsFilePath,
+      JSON.stringify(
+        {
+          clients: Object.fromEntries(clientSessionPins.entries()),
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+  } catch (error) {
+    process.stderr.write(`Failed to persist client session pins: ${String(error)}\n`);
+  }
+}
+
+function getRequestClientId(req, parsedUrl) {
+  return normalizeClientId(req.headers["x-codex2web-client-id"]) ||
+    normalizeClientId(parsedUrl.searchParams.get("clientId") || "");
+}
+
+function getClientPinnedSessionId(clientId) {
+  return clientId && clientSessionPins.has(clientId)
+    ? clientSessionPins.get(clientId)
+    : bridge.getBinding().pinnedSessionId;
+}
+
+function getClientBinding(clientId) {
+  return bridge.getBinding(getClientPinnedSessionId(clientId));
 }
 
 function commandAvailable(command, args = ["--version"]) {
@@ -656,8 +715,8 @@ function toErrorPayload(error) {
   };
 }
 
-function writeBridgeState(res) {
-  sendSseEvent(res, "state", bridge.getBinding());
+function writeBridgeState(res, clientId) {
+  sendSseEvent(res, "state", getClientBinding(clientId));
   sendSseEvent(res, "failureModes", bridge.getFailureModes());
 }
 
@@ -694,13 +753,15 @@ function trimTranscriptTail(entries, limit = STREAM_REPLAY_TRANSCRIPT_LIMIT) {
 async function handleApi(req, res, parsedUrl) {
   const pathname = parsedUrl.pathname;
   const method = req.method || "GET";
+  const clientId = getRequestClientId(req, parsedUrl);
+  const clientSessionId = getClientPinnedSessionId(clientId);
 
   try {
     if (method === "GET" && pathname === "/api/sessions") {
       const sessions = await bridge.discoverSessions();
       sendJson(res, 200, {
         ok: true,
-        pinnedSessionId: bridge.getBinding().pinnedSessionId,
+        pinnedSessionId: clientSessionId,
         sessions,
       });
       return;
@@ -708,7 +769,7 @@ async function handleApi(req, res, parsedUrl) {
 
     if (method === "GET" && pathname === "/api/session/binding") {
       await bridge.discoverSessions();
-      const binding = bridge.getBinding();
+      const binding = bridge.getBinding(clientSessionId);
       const transcript = await bridge.getTranscript(binding.pinnedSessionId);
       sendJson(res, 200, {
         auditTrail: bridge.getAuditTrail(20),
@@ -724,9 +785,9 @@ async function handleApi(req, res, parsedUrl) {
       await bridge.discoverSessions();
       const afterId = String(parsedUrl.searchParams.get("after") || "");
       const forceFull = String(parsedUrl.searchParams.get("force") || "").toLowerCase() === "full";
-      const snapshot = await bridge.getTranscriptSnapshot({ afterId, forceFull });
+      const snapshot = await bridge.getTranscriptSnapshot({ afterId, forceFull, sessionId: clientSessionId });
       sendJson(res, 200, {
-        binding: bridge.getBinding(),
+        binding: bridge.getBinding(clientSessionId),
         failureModes: bridge.getFailureModes(),
         ok: true,
         snapshot: snapshot.reset
@@ -751,13 +812,13 @@ async function handleApi(req, res, parsedUrl) {
 
     if (method === "GET" && pathname === "/api/system/meta") {
       sendJson(res, 200, {
-        execution: bridge.getExecutionPolicy(),
+        execution: bridge.getExecutionPolicy(clientSessionId),
         executionRuntime: bridge.getExecutionRuntimeConfig?.() || null,
         externalMode: requiresExternalAuthBoundary,
         host,
         ok: true,
         port,
-        provider: bridge.getProviderInfo(),
+        provider: bridge.getProviderInfo(clientSessionId),
         runtime: getRuntimeReadiness(),
         security: {
           authEnabled,
@@ -776,9 +837,10 @@ async function handleApi(req, res, parsedUrl) {
       const result = await bridge.setModelSelection({
         model: body.model,
         provider: body.provider,
+        sessionId: clientSessionId,
       });
       sendJson(res, 200, {
-        binding: bridge.getBinding(),
+        binding: bridge.getBinding(clientSessionId),
         ok: true,
         ...result,
       });
@@ -787,9 +849,13 @@ async function handleApi(req, res, parsedUrl) {
 
     if (method === "POST" && pathname === "/api/session/attach") {
       const body = await readJsonBody(req);
-      const binding = await bridge.attachSession(body.sessionId, body.explicit);
+      const binding = await bridge.attachSession(body.sessionId, body.explicit, { persist: !clientId });
+      if (clientId) {
+        clientSessionPins.set(clientId, binding.pinnedSessionId);
+        await persistClientSessionPins();
+      }
       sendJson(res, 200, {
-        binding,
+        binding: clientId ? bridge.getBinding(binding.pinnedSessionId) : binding,
         ok: true,
       });
       return;
@@ -798,17 +864,17 @@ async function handleApi(req, res, parsedUrl) {
     if (method === "POST" && pathname === "/api/session/send") {
       const body = await readJsonBody(req, MAX_SEND_BODY_BYTES);
       const imagePaths = await persistImageAttachments(body.images);
-      const currentProvider = bridge.getProviderInfo?.()?.model?.current?.provider || "";
+      const currentProvider = bridge.getProviderInfo?.(clientSessionId)?.model?.current?.provider || "";
       const imageAnalyses = currentProvider === "deepseek" ? runImageOcr(imagePaths) : [];
-      const result = await bridge.sendInput(body.message, { imageAnalyses, imagePaths });
+      const result = await bridge.sendInput(body.message, { imageAnalyses, imagePaths, sessionId: clientSessionId });
       sendJson(res, 200, { ok: true, result });
       return;
     }
 
     if (method === "POST" && pathname === "/api/session/stop") {
-      const result = await bridge.stopInput();
+      const result = await bridge.stopInput({ sessionId: clientSessionId });
       sendJson(res, 200, {
-        binding: bridge.getBinding(),
+        binding: bridge.getBinding(clientSessionId),
         ok: true,
         result,
       });
@@ -843,11 +909,11 @@ async function handleApi(req, res, parsedUrl) {
         "x-accel-buffering": "no",
       });
       res.write(": connected\n\n");
-      writeBridgeState(res);
+      writeBridgeState(res, clientId);
 
-      const binding = bridge.getBinding();
+      const binding = getClientBinding(clientId);
       const afterId = String(parsedUrl.searchParams.get("after") || "");
-      const snapshot = await bridge.getTranscriptSnapshot({ afterId });
+      const snapshot = await bridge.getTranscriptSnapshot({ afterId, sessionId: binding.pinnedSessionId });
       const replayEntries = afterId
         ? snapshot.reset
           ? trimTranscriptTail(snapshot.entries)
@@ -858,9 +924,19 @@ async function handleApi(req, res, parsedUrl) {
       }
 
       const unsubscribe = bridge.subscribe((event) => {
+        const currentBinding = getClientBinding(clientId);
+        const currentPinned = currentBinding.pinnedSessionId;
+        if (event.type === "state") {
+          sendSseEvent(res, "state", currentBinding);
+          return;
+        }
         if (event.type === "message") {
-          const currentPinned = bridge.getBinding().pinnedSessionId;
           if (event.payload.sessionId !== currentPinned) {
+            return;
+          }
+        }
+        if (event.type === "stop" || event.type === "sendFailure") {
+          if (event.payload?.sessionId && event.payload.sessionId !== currentPinned) {
             return;
           }
         }
@@ -889,7 +965,11 @@ async function handleApi(req, res, parsedUrl) {
     });
   } catch (error) {
     const payload = toErrorPayload(error);
-    const statusCode = error instanceof BridgeError ? error.statusCode : 500;
+    const statusCode = error instanceof BridgeError && error.code === "SEND_FAILED"
+      ? 409
+      : error instanceof BridgeError
+        ? error.statusCode
+        : 500;
     sendJson(res, statusCode, payload);
   }
 }
