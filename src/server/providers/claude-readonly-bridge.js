@@ -322,7 +322,7 @@ function modelOption({ model, provider, source }) {
   const normalizedModel = normalizeModelName(model);
   const normalizedProvider = inferModelProvider(normalizedModel, provider);
   return {
-    cliModel: normalizedProvider === "deepseek" ? getDeepSeekClaudeCliAlias(normalizedModel) : normalizedModel,
+    cliModel: normalizedProvider === "deepseek" ? "" : normalizedModel,
     id: `${normalizedProvider}:${normalizedModel}`,
     label: formatModelDisplayName(normalizedModel, normalizedProvider),
     model: normalizedModel,
@@ -562,7 +562,7 @@ export function resolveModelSelection(catalog, request = {}) {
   const requestObject = request && typeof request === "object" ? request : {};
   const requestedProvider = normalizeModelName(requestObject.provider).toLowerCase();
   const requestedModel = normalizeModelName(
-    requestObject.model || requestObject.id || requestObject.cliModel || (typeof request === "string" ? request : ""),
+    requestObject.model || requestObject.id || (typeof request === "string" ? request : "") || requestObject.cliModel,
   );
   const key = requestedModel.toLowerCase();
 
@@ -1902,8 +1902,21 @@ export class ClaudeReadonlyBridge {
   getBinding(sessionId = this.#pinnedSessionId) {
     const effectiveSessionId = trimText(sessionId) || this.#pinnedSessionId;
     const session = this.#getSession(effectiveSessionId);
-    const executionState = this.#getExecutionState(effectiveSessionId);
     const isSending = this.#sendingSessionIds.has(effectiveSessionId);
+    let executionState = this.#getExecutionState(effectiveSessionId);
+    if (
+      !isSending &&
+      executionState &&
+      (executionState.phase === "starting" || executionState.phase === "running" || executionState.phase === "stopping")
+    ) {
+      executionState = this.#setExecutionState(effectiveSessionId, {
+        lastActivityAt: nowIso(),
+        phase: "idle",
+        pid: null,
+        processAlive: false,
+        statusDetail: "没有活动中的 Claude2Web 执行进程，已恢复为空闲状态。",
+      }, { emit: false });
+    }
     const send = !this.#sendReadiness.sendReady
       ? "disabled"
       : executionState?.phase === "failed"
@@ -2991,7 +3004,7 @@ export class ClaudeReadonlyBridge {
       if (transcript.length > DEFAULT_TRANSCRIPT_LIMIT) {
         transcript.splice(0, transcript.length - DEFAULT_TRANSCRIPT_LIMIT);
       }
-      const executionState = this.#executionStateBySession.get(outputSessionId);
+      const executionState = runContext ? this.#executionStateBySession.get(outputSessionId) : null;
       if (executionState && (executionState.phase === "starting" || executionState.phase === "running")) {
         const visibleAt = entry.time || nowIso();
         const toolActivity = entry.toolActivity

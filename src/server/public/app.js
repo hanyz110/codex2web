@@ -67,6 +67,7 @@ const mobileStatusPill = document.querySelector("#mobileStatusPill");
 const favoriteCurrentSession = document.querySelector("#favoriteCurrentSession");
 const favoriteSessionCount = document.querySelector("#favoriteSessionCount");
 const favoriteSessionsList = document.querySelector("#favoriteSessions");
+const sessionSearchInput = document.querySelector("#sessionSearchInput");
 const sessionCandidates = document.querySelector("#sessionCandidates");
 const auditList = document.querySelector("#auditList");
 const securityMode = document.querySelector("#securityMode");
@@ -123,8 +124,11 @@ let snapshotPollInFlight = false;
 let snapshotPollMs = 0;
 let snapshotPollTimer = null;
 let transportWatchdogTimer = null;
+let terminalExecutionBySession = new Map();
 let sessionsLoaded = false;
 let sessionsLoadingPromise = null;
+let sessionSearchQuery = "";
+let sessionSearchRefreshTimer = 0;
 let favoriteSessions = new Map();
 let lastMessageCopyTap = { at: 0, messageId: "" };
 const COMPOSER_MIN_HEIGHT = 38;
@@ -409,6 +413,26 @@ function toggleFavoriteSession(session) {
   return nextFavorite;
 }
 
+function normalizeSessionSearchText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function sessionMatchesSearch(session, query) {
+  const normalizedQuery = normalizeSessionSearchText(query);
+  if (!normalizedQuery) {
+    return true;
+  }
+
+  return [
+    session.name,
+    session.projectPath,
+    basename(session.projectPath || ""),
+    session.id,
+  ]
+    .map(normalizeSessionSearchText)
+    .some((value) => value.includes(normalizedQuery));
+}
+
 function parseIsoTime(value) {
   if (!value) {
     return 0;
@@ -442,6 +466,78 @@ function formatDuration(ms) {
   const hours = Math.floor(minutes / 60);
   const remainMinutes = minutes % 60;
   return remainMinutes === 0 ? `${hours} 小时` : `${hours} 小时 ${remainMinutes} 分`;
+}
+
+function parseTimeMs(value) {
+  const parsed = Date.parse(value || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getBindingSessionId(binding) {
+  return String(binding?.pinnedSessionId || binding?.executionState?.sessionId || state.pinnedSessionId || "");
+}
+
+function isActiveBinding(binding) {
+  return binding?.send === "sending" || binding?.send === "stopping";
+}
+
+function isTerminalBinding(binding) {
+  const executionState = binding?.executionState || {};
+  return (
+    binding?.send === "idle" &&
+    executionState.phase === "idle" &&
+    (executionState.exitCode !== null || executionState.processAlive === false)
+  );
+}
+
+function getExecutionFingerprint(binding) {
+  const executionState = binding?.executionState || {};
+  return {
+    lastActivityAtMs: parseTimeMs(executionState.lastActivityAt || executionState.updatedAt || binding?.updatedAt),
+    pid: executionState.pid == null ? "" : String(executionState.pid),
+    startedAtMs: parseTimeMs(executionState.startedAt || executionState.acceptedAt || ""),
+  };
+}
+
+function rememberTerminalExecution(binding) {
+  if (!isTerminalBinding(binding)) {
+    return;
+  }
+
+  const sessionId = getBindingSessionId(binding);
+  if (!sessionId) {
+    return;
+  }
+
+  terminalExecutionBySession.set(sessionId, getExecutionFingerprint(binding));
+}
+
+function shouldIgnoreStaleActiveBinding(binding) {
+  if (!isActiveBinding(binding)) {
+    return false;
+  }
+
+  const sessionId = getBindingSessionId(binding);
+  const terminal = terminalExecutionBySession.get(sessionId);
+  if (!terminal) {
+    return false;
+  }
+
+  const incoming = getExecutionFingerprint(binding);
+  if (incoming.pid && terminal.pid && incoming.pid === terminal.pid) {
+    return true;
+  }
+
+  if (
+    terminal.startedAtMs &&
+    incoming.startedAtMs &&
+    incoming.startedAtMs <= terminal.startedAtMs &&
+    incoming.lastActivityAtMs <= terminal.lastActivityAtMs
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function deriveExecutionFeedback() {
@@ -584,7 +680,7 @@ function deriveHeaderExecutionState(feedback) {
     };
   }
 
-  if (feedback?.kind === "running" || state.send === "sending" || executionState?.phase === "running") {
+  if (feedback?.kind === "running" || state.send === "sending") {
     return { label: "执行中", state: "running", summary };
   }
 
@@ -1738,20 +1834,97 @@ function renderFavoriteSessions() {
 
 function renderSessionCandidates() {
   sessionCandidates.innerHTML = "";
+  const query = normalizeSessionSearchText(sessionSearchQuery);
 
   if (!sessionsLoaded) {
     const item = document.createElement("li");
-    item.textContent = sessionsLoadingPromise ? "正在加载会话列表..." : "点击刷新后加载可切换会话。";
+    item.className = "session-search-empty";
+    item.textContent = sessionsLoadingPromise
+      ? "正在加载会话列表..."
+      : query
+        ? "正在加载会话后搜索..."
+        : "点击刷新后加载可切换会话。";
     sessionCandidates.append(item);
     return;
   }
 
-  const candidates = state.sessions.filter((item) => item.id !== state.pinnedSessionId);
+  const candidates = state.sessions
+    .filter((item) => item.id !== state.pinnedSessionId)
+    .filter((item) => sessionMatchesSearch(item, query))
+    .sort((left, right) => parseIsoTime(right.updatedAt) - parseIsoTime(left.updatedAt));
 
   if (candidates.length === 0) {
     const item = document.createElement("li");
-    item.textContent = "当前没有其他可切换会话。";
+    item.className = "session-search-empty";
+    item.textContent = query && sessionsLoadingPromise
+      ? "正在刷新会话后搜索..."
+      : query
+        ? "没有匹配的会话。"
+        : "当前没有其他可切换会话。";
     sessionCandidates.append(item);
+    return;
+  }
+
+  if (query) {
+    const summary = document.createElement("li");
+    summary.className = "session-search-summary";
+    summary.textContent = `找到 ${candidates.length} 个匹配会话`;
+    sessionCandidates.append(summary);
+
+    for (const session of candidates) {
+      const item = document.createElement("li");
+
+      const header = document.createElement("div");
+      header.className = "session-item-header";
+
+      const titleWrap = document.createElement("div");
+      titleWrap.className = "session-item-title-wrap";
+
+      const title = document.createElement("p");
+      title.className = "session-item-title";
+      title.textContent = session.name || session.id;
+
+      const chips = document.createElement("div");
+      chips.className = "session-item-tags";
+
+      const projectTag = document.createElement("span");
+      projectTag.className = "session-item-tag is-project";
+      projectTag.textContent = basename(session.projectPath);
+
+      const scope = document.createElement("span");
+      scope.className = "session-item-tag";
+      scope.textContent = session.projectPath === state.sessionProjectPath ? "同项目" : "跨项目";
+
+      chips.append(projectTag, scope);
+      titleWrap.append(title, chips);
+
+      const actions = document.createElement("div");
+      actions.className = "session-inline-actions";
+
+      const favoriteButton = createFavoriteButton(session, { compact: true });
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn-secondary";
+      button.textContent = "切换";
+      button.setAttribute("data-session-id", session.id);
+
+      actions.append(favoriteButton, button);
+
+      const meta = document.createElement("p");
+      meta.className = "session-item-meta";
+      meta.textContent = [
+        session.projectPath,
+        session.updatedAt ? `updated ${formatTime(session.updatedAt)}` : "",
+        session.id,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+
+      header.append(titleWrap, actions);
+      item.append(header, meta);
+      sessionCandidates.append(item);
+    }
     return;
   }
 
@@ -2070,6 +2243,10 @@ function renderState() {
 }
 
 function updateBinding(binding) {
+  if (shouldIgnoreStaleActiveBinding(binding)) {
+    return false;
+  }
+
   const previousSessionId = state.pinnedSessionId || "";
   state.attach = binding.attach;
   state.connection = binding.connection;
@@ -2094,6 +2271,8 @@ function updateBinding(binding) {
   setText(sessionProjectLabel, projectLabel);
   syncFavoriteSessionsFromState();
   renderFavoriteSessions();
+  rememberTerminalExecution(binding);
+  return true;
 }
 
 function normalizeMessageText(value) {
@@ -2592,7 +2771,9 @@ function reconnectStream() {
     }
 
     markTransportActivity();
-    updateBinding(payload);
+    if (!updateBinding(payload)) {
+      return;
+    }
     renderState();
     refreshSnapshotPoller();
     refreshTransportWatchdog();
@@ -2946,6 +3127,24 @@ favoriteCurrentSession?.addEventListener("click", () => {
   toggleFavoriteSession(current);
 });
 
+sessionSearchInput?.addEventListener("input", () => {
+  sessionSearchQuery = sessionSearchInput.value || "";
+  renderSessionCandidates();
+  window.clearTimeout(sessionSearchRefreshTimer);
+  sessionSearchRefreshTimer = window.setTimeout(() => {
+    void ensureSessionCatalogLoaded({ force: true, silent: true });
+  }, 180);
+  if (!sessionsLoadingPromise && !sessionsLoaded) {
+    void ensureSessionCatalogLoaded({ silent: true });
+  }
+});
+
+sessionSearchInput?.addEventListener("focus", () => {
+  if (!sessionsLoadingPromise) {
+    void ensureSessionCatalogLoaded({ force: true, silent: true });
+  }
+});
+
 sessionCandidates?.addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof Element)) {
@@ -3185,6 +3384,7 @@ async function sendCurrentMessage() {
   autoResizeComposer();
 
   state.send = "sending";
+  terminalExecutionBySession.delete(state.pinnedSessionId || "");
   state.executionState = {
     acceptedAt: null,
     exitCode: null,

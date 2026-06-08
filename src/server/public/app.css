@@ -1910,6 +1910,62 @@ textarea:focus-visible {
   font-size: 11.5px;
 }
 
+.session-search {
+  margin-top: 8px;
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 12px;
+  background: rgba(248, 250, 252, 0.86);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-search svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+}
+
+.session-search input {
+  width: 100%;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.session-search input::placeholder {
+  color: #94a3b8;
+}
+
+.session-search:focus-within {
+  border-color: rgba(37, 99, 235, 0.28);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08);
+}
+
+.session-search-empty {
+  padding: 10px 0 !important;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.session-search-summary {
+  padding: 8px 0 6px !important;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
 .session-favorite-button {
   width: 36px;
   height: 36px;

@@ -59,6 +59,109 @@ test("resolveModelSelection honors requested provider before cliModel aliases", 
   assert.equal(selected.model, "claude-opus-4-7");
 });
 
+test("DeepSeek model selection does not pass a Claude --model alias", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "claude2web-deepseek-no-alias-"));
+  const sessionRoot = path.join(tempDir, "projects");
+  const projectDir = path.join(sessionRoot, "project");
+  const sourceSessionId = "deepseek-no-alias-session";
+  const fakeClaude = path.join(tempDir, "claude");
+  const argsLog = path.join(tempDir, "args.log");
+  const envLog = path.join(tempDir, "env.log");
+
+  await mkdir(projectDir, { recursive: true });
+  await writeFile(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"--help\" ]; then",
+      "  echo \"--model claude-opus-4-8 claude-opus-4-7 deepseek-v4-pro[1m]\"",
+      "  exit 0",
+      "fi",
+      `printf '%s\\n' "$@" >> '${argsLog.replaceAll("'", "'\\''")}'`,
+      `printf '%s\\n' "$ANTHROPIC_MODEL" >> '${envLog.replaceAll("'", "'\\''")}'`,
+      "input=$(cat)",
+      "prompt=\"$input\"",
+      "for arg in \"$@\"; do prompt=\"$arg\"; done",
+      "case \"$input\" in",
+      "  *Reply\\ exactly:*)",
+      "    printf '%s\\n' \"${input##*Reply exactly: }\"",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "case \"$prompt\" in",
+      "  *Reply\\ exactly:*)",
+      "    printf '%s\\n' \"${prompt##*Reply exactly: }\"",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "session_id=\"\"",
+      "prev=\"\"",
+      "for arg in \"$@\"; do",
+      "  if [ \"$prev\" = \"--resume\" ]; then session_id=\"$arg\"; fi",
+      "  if [ \"$prev\" = \"--session-id\" ]; then session_id=\"$arg\"; fi",
+      "  prev=\"$arg\"",
+      "done",
+      "printf '{\"type\":\"assistant\",\"sessionId\":\"%s\",\"timestamp\":\"2026-06-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"OK\"}]}}\\n' \"$session_id\"",
+      "printf '{\"type\":\"result\",\"sessionId\":\"%s\",\"subtype\":\"success\",\"modelUsage\":{\"deepseek-v4-pro\":{\"inputTokens\":1,\"outputTokens\":1}}}\\n' \"$session_id\"",
+    ].join("\n"),
+    "utf-8",
+  );
+  await chmod(fakeClaude, 0o755);
+  await writeFile(
+    path.join(projectDir, `${sourceSessionId}.jsonl`),
+    JSON.stringify({
+      cwd: projectDir,
+      message: { content: [{ text: "hello", type: "text" }], role: "user" },
+      sessionId: sourceSessionId,
+      timestamp: "2026-06-01T00:00:00.000Z",
+      type: "user",
+    }),
+    "utf-8",
+  );
+
+  const previousEnv = {
+    ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
+    CLAUDE2WEB_DEFAULT_MODEL: process.env.CLAUDE2WEB_DEFAULT_MODEL,
+  };
+  process.env.ANTHROPIC_MODEL = "deepseek-v4-pro[1m]";
+  process.env.CLAUDE2WEB_DEFAULT_MODEL = "deepseek-v4-pro[1m]";
+
+  try {
+    const bridge = new ClaudeReadonlyBridge({
+      auditFilePath: path.join(tempDir, "audit.jsonl"),
+      claudeBinaryPath: fakeClaude,
+      sendRequested: true,
+      sessionRootPath: sessionRoot,
+      stateFilePath: path.join(tempDir, "state.json"),
+    });
+    await bridge.init();
+
+    const current = bridge.getProviderInfo(sourceSessionId).model.current;
+    assert.equal(current.provider, "deepseek");
+    assert.equal(current.model, "deepseek-v4-pro[1m]");
+
+    await bridge.sendInput("use deepseek");
+
+    const args = await readFile(argsLog, "utf-8");
+    const env = await readFile(envLog, "utf-8");
+    assert.doesNotMatch(args, /--model\nclaude-opus-4-7/);
+    assert.doesNotMatch(args, /--model\nclaude-opus-4-8/);
+    assert.match(env, /deepseek-v4-pro\[1m\]/);
+  } finally {
+    if (previousEnv.ANTHROPIC_MODEL == null) {
+      delete process.env.ANTHROPIC_MODEL;
+    } else {
+      process.env.ANTHROPIC_MODEL = previousEnv.ANTHROPIC_MODEL;
+    }
+    if (previousEnv.CLAUDE2WEB_DEFAULT_MODEL == null) {
+      delete process.env.CLAUDE2WEB_DEFAULT_MODEL;
+    } else {
+      process.env.CLAUDE2WEB_DEFAULT_MODEL = previousEnv.CLAUDE2WEB_DEFAULT_MODEL;
+    }
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
 test("buildDeepSeekSafeForkPrompt does not nest previous safe-fork scaffolds", () => {
   const prompt = buildDeepSeekSafeForkPrompt({
     latestPrompt: "继续",
