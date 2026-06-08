@@ -642,6 +642,15 @@ function deriveExecutionFeedback() {
     }
   }
 
+  if (executionState?.phase === "background") {
+    return {
+      detail: toolDetail || statusDetail || "Claude 主执行已结束，但仍有后台任务等待输出。",
+      durationMs: toolAgeMs,
+      kind: "background",
+      summary: "后台任务仍在运行",
+    };
+  }
+
   return {
     detail: connectionReady ? statusDetail : "等待实时连接恢复后继续同步状态。",
     durationMs: 0,
@@ -666,6 +675,10 @@ function deriveHeaderExecutionState(feedback) {
 
   if (feedback?.kind === "quiet") {
     return { label: "执行中", state: "running", summary: `已无输出${durationLabel}` };
+  }
+
+  if (feedback?.kind === "background") {
+    return { label: "后台任务", state: "running", summary: `后台任务未完成${durationLabel}` };
   }
 
   if (feedback?.kind === "stopping" || executionState?.phase === "stopping") {

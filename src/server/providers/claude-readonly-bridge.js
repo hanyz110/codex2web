@@ -716,6 +716,23 @@ function summarizeToolInput(name, input) {
 
 function summarizeToolResult(record, block) {
   const result = record?.toolUseResult && typeof record.toolUseResult === "object" ? record.toolUseResult : {};
+  if (result.backgroundTaskId) {
+    const taskId = trimText(result.backgroundTaskId);
+    const content = typeof block?.content === "string" ? block.content : "";
+    const outputFile = trimText(
+      result.outputFile
+        || result.output_file
+        || content.match(/Output is being written to:\s*(\S+?\.output)\b/)?.[1]
+        || "",
+    );
+    return truncateToolText(
+      [
+        `后台任务 ${taskId} 正在运行。`,
+        outputFile ? `输出文件：${outputFile}` : "",
+        "Claude CLI 会在任务完成后追加通知；完成前不能视为本轮任务完整结束。",
+      ].filter(Boolean).join("\n"),
+    );
+  }
   const content = typeof block?.content === "string" ? block.content : "";
   const stdout = typeof result.stdout === "string" ? result.stdout : "";
   const stderr = typeof result.stderr === "string" ? result.stderr : "";
@@ -758,14 +775,15 @@ export function extractClaudeToolActivity(record) {
       return null;
     }
     const isError = Boolean(block.is_error || record?.toolUseResult?.is_error);
+    const backgroundTaskId = trimText(record?.toolUseResult?.backgroundTaskId || "");
     const summary = summarizeToolResult(record, block);
     return {
       detail: summary,
       name: "工具",
-      status: isError ? "error" : "done",
-      summary: isError ? "工具返回错误" : "工具返回结果",
+      status: backgroundTaskId ? "background" : isError ? "error" : "done",
+      summary: backgroundTaskId ? `后台任务 ${backgroundTaskId} 正在运行` : isError ? "工具返回错误" : "工具返回结果",
       text: [
-        isError ? "工具返回错误" : "工具返回结果",
+        backgroundTaskId ? "后台任务运行中" : isError ? "工具返回错误" : "工具返回结果",
         summary ? `结果摘要：\n\`\`\`text\n${summary}\n\`\`\`` : "",
       ].filter(Boolean).join("\n\n"),
     };
@@ -2704,6 +2722,30 @@ export class ClaudeReadonlyBridge {
       let streamRemainder = "";
       let modelEvidence = null;
 
+      const recordToolActivity = (record) => {
+        const toolActivity = extractClaudeToolActivity(record);
+        if (!toolActivity) {
+          return;
+        }
+
+        const visibleAt = record?.timestamp || nowIso();
+        runContext.lastToolActivity = {
+          detail: toolActivity.detail || "",
+          name: toolActivity.name || "工具",
+          status: toolActivity.status || "running",
+          summary: toolActivity.summary || toolActivity.text || "",
+          time: visibleAt,
+        };
+        this.#setRunExecutionState(session, runContext, {
+          lastActivityAt: visibleAt,
+          lastToolActivity: runContext.lastToolActivity,
+          phase: accepted ? (runContext.stopRequested ? "stopping" : "running") : "starting",
+          pid: child.pid || null,
+          processAlive: true,
+          statusDetail: `${toolActivity.status === "running" ? "正在执行" : toolActivity.status === "background" ? "后台运行" : "刚完成"} ${toolActivity.name}：${toolActivity.summary}`,
+        }, { emit: false });
+      };
+
       const recordModelEvidence = (record) => {
         const evidence = extractExecutionModelEvidence(record);
         if (!evidence) {
@@ -2740,6 +2782,7 @@ export class ClaudeReadonlyBridge {
         for (const line of lines) {
           const parsed = safeJsonParse(line);
           if (parsed) {
+            recordToolActivity(parsed);
             recordModelEvidence(parsed);
           }
         }
@@ -2771,11 +2814,11 @@ export class ClaudeReadonlyBridge {
         this.#emit("state", this.getBinding());
       });
 
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
         clearTimeout(timeoutId);
-        void this.#finishRunAfterFinalPoll(session, runContext);
         const trailingRecord = safeJsonParse(streamRemainder);
         if (trailingRecord) {
+          recordToolActivity(trailingRecord);
           recordModelEvidence(trailingRecord);
         }
         modelEvidence = modelEvidence || extractExecutionModelEvidenceFromOutput(stdoutText);
@@ -2785,6 +2828,12 @@ export class ClaudeReadonlyBridge {
           model: currentModel.model,
           provider: currentModel.provider,
         };
+
+        try {
+          await this.#pollSession(session, runContext);
+        } catch (error) {
+          process.stderr.write(`Failed to poll final Claude transcript output: ${String(error)}\n`);
+        }
 
         if (runContext.stopRequested) {
           const detail = code === 0 ? "Claude 执行已停止。" : `Claude 执行已停止（退出码 ${String(code)}）。`;
@@ -2810,29 +2859,38 @@ export class ClaudeReadonlyBridge {
           if (!accepted) {
             accept();
           }
+          this.#finishRun(session.id, runContext);
           return;
         }
 
         if (code === 0) {
+          const backgroundActivity = runContext.lastToolActivity?.status === "background"
+            ? runContext.lastToolActivity
+            : null;
           this.#setRunExecutionState(session, runContext, {
             actualModel: modelEvidence?.actualModel || null,
             exitCode: 0,
             lastActivityAt: nowIso(),
+            lastToolActivity: backgroundActivity || runContext.lastToolActivity || null,
             modelUsage: modelEvidence?.modelUsage || null,
             modelUsageModels: modelEvidence?.modelUsageModels || [],
-            phase: "idle",
+            phase: backgroundActivity ? "background" : "idle",
             pid: child.pid || null,
             processAlive: false,
             selectedModel,
-            statusDetail: `Claude 执行已完成，${formatExecutionModelDetail(currentModel, modelEvidence)} 可继续发送下一条指令。`,
+            statusDetail: backgroundActivity
+              ? `Claude 主执行已结束，但后台任务仍在运行：${backgroundActivity.summary}。${formatExecutionModelDetail(currentModel, modelEvidence)}`
+              : `Claude 执行已完成，${formatExecutionModelDetail(currentModel, modelEvidence)} 可继续发送下一条指令。`,
           }, { emit: false });
           this.#emit("state", this.getBinding());
           if (!accepted) {
             accept();
           }
+          this.#finishRun(session.id, runContext);
           return;
         }
 
+        this.#finishRun(session.id, runContext);
         fail(`Claude send exited with code ${String(code)}: ${summarizeProcessOutput(stdoutText, stderrText)}`);
       });
 
@@ -3030,7 +3088,7 @@ export class ClaudeReadonlyBridge {
           phase: "running",
           processAlive: true,
           statusDetail: toolActivity
-            ? `${toolActivity.status === "running" ? "正在执行" : "刚完成"} ${toolActivity.name}：${toolActivity.summary}`
+            ? `${toolActivity.status === "running" ? "正在执行" : toolActivity.status === "background" ? "后台运行" : "刚完成"} ${toolActivity.name}：${toolActivity.summary}`
             : "Claude 执行中，已收到新的可见输出。",
         }, { emit: false });
       }

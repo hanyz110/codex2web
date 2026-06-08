@@ -290,6 +290,31 @@ test("extractClaudeToolActivity summarizes tool results", () => {
   assert.match(activity.text, /25 passed/);
 });
 
+test("extractClaudeToolActivity keeps background tasks running", () => {
+  const activity = extractClaudeToolActivity({
+    message: {
+      content: [
+        {
+          content: "Command running in background with ID: bgf082sp8. Output is being written to: /private/tmp/claude-501/project/session/tasks/bgf082sp8.output. You will be notified when it completes.",
+          type: "tool_result",
+        },
+      ],
+      role: "user",
+    },
+    toolUseResult: {
+      backgroundTaskId: "bgf082sp8",
+      stderr: "",
+      stdout: "",
+    },
+    type: "user",
+  });
+
+  assert.equal(activity.status, "background");
+  assert.match(activity.summary, /bgf082sp8/);
+  assert.match(activity.text, /后台任务/);
+  assert.match(activity.text, /bgf082sp8\.output/);
+});
+
 test("Claude transcript history page can load entries older than the initial tail", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "claude2web-history-page-"));
   const sessionRoot = path.join(tempDir, "projects");
@@ -355,6 +380,98 @@ test("Claude transcript history page can load entries older than the initial tai
     assert.equal(page.entries.at(-1).text, "history message 80");
     assert.equal(page.hasMore, true);
   } finally {
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
+test("Claude send completion preserves pending background task state", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "claude2web-background-task-"));
+  const sessionRoot = path.join(tempDir, "projects");
+  const projectDir = path.join(sessionRoot, "project");
+  const sourceSessionId = "background-task-session";
+  const fakeClaude = path.join(tempDir, "claude");
+
+  await mkdir(projectDir, { recursive: true });
+  await writeFile(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"--help\" ]; then",
+      "  echo \"--model claude-opus-4-8 deepseek-v4-pro[1m]\"",
+      "  exit 0",
+      "fi",
+      "input=$(cat)",
+      "prompt=\"$input\"",
+      "for arg in \"$@\"; do prompt=\"$arg\"; done",
+      "case \"$prompt\" in",
+      "  *Reply\\ exactly:*)",
+      "    printf '%s\\n' \"${prompt##*Reply exactly: }\"",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "session_id=\"\"",
+      "prev=\"\"",
+      "for arg in \"$@\"; do",
+      "  if [ \"$prev\" = \"--resume\" ]; then session_id=\"$arg\"; fi",
+      "  if [ \"$prev\" = \"--session-id\" ]; then session_id=\"$arg\"; fi",
+      "  prev=\"$arg\"",
+      "done",
+      "record='{ \"type\":\"user\", \"sessionId\":\"'\"$session_id\"'\", \"timestamp\":\"2026-06-01T00:00:02.000Z\", \"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":\"Command running in background with ID: bgf082sp8.\"}]}, \"toolUseResult\":{\"backgroundTaskId\":\"bgf082sp8\",\"stdout\":\"\",\"stderr\":\"\"} }'",
+      `printf '%s\\n' "$record" >> '${projectDir.replaceAll("'", "'\\''")}/'\"$session_id\"'.jsonl'`,
+      "printf '%s\\n' \"$record\"",
+      "printf '{\"type\":\"result\",\"sessionId\":\"%s\",\"subtype\":\"success\",\"modelUsage\":{\"deepseek-v4-pro[1m]\":{\"inputTokens\":1,\"outputTokens\":1}}}\\n' \"$session_id\"",
+    ].join("\n"),
+    "utf-8",
+  );
+  await chmod(fakeClaude, 0o755);
+  await writeFile(
+    path.join(projectDir, `${sourceSessionId}.jsonl`),
+    JSON.stringify({
+      cwd: projectDir,
+      message: { content: [{ text: "hello", type: "text" }], role: "user" },
+      sessionId: sourceSessionId,
+      timestamp: "2026-06-01T00:00:00.000Z",
+      type: "user",
+    }),
+    "utf-8",
+  );
+
+  const previousEnv = {
+    ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
+    CLAUDE2WEB_DEFAULT_MODEL: process.env.CLAUDE2WEB_DEFAULT_MODEL,
+  };
+  process.env.ANTHROPIC_MODEL = "deepseek-v4-pro[1m]";
+  process.env.CLAUDE2WEB_DEFAULT_MODEL = "deepseek-v4-pro[1m]";
+
+  try {
+    const bridge = new ClaudeReadonlyBridge({
+      auditFilePath: path.join(tempDir, "audit.jsonl"),
+      claudeBinaryPath: fakeClaude,
+      sendRequested: true,
+      sessionRootPath: sessionRoot,
+      stateFilePath: path.join(tempDir, "state.json"),
+    });
+    await bridge.init();
+    await bridge.sendInput("run codex review");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await bridge.getTranscriptSnapshot({ forceFull: true, sessionId: sourceSessionId });
+
+    const binding = bridge.getBinding(sourceSessionId);
+    assert.equal(binding.send, "idle");
+    assert.equal(binding.executionState.phase, "background");
+    assert.match(binding.executionState.statusDetail, /后台任务仍在运行/);
+    assert.equal(binding.executionState.lastToolActivity.status, "background");
+  } finally {
+    if (previousEnv.ANTHROPIC_MODEL == null) {
+      delete process.env.ANTHROPIC_MODEL;
+    } else {
+      process.env.ANTHROPIC_MODEL = previousEnv.ANTHROPIC_MODEL;
+    }
+    if (previousEnv.CLAUDE2WEB_DEFAULT_MODEL == null) {
+      delete process.env.CLAUDE2WEB_DEFAULT_MODEL;
+    } else {
+      process.env.CLAUDE2WEB_DEFAULT_MODEL = previousEnv.CLAUDE2WEB_DEFAULT_MODEL;
+    }
     await rm(tempDir, { force: true, recursive: true });
   }
 });
