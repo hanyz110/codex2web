@@ -161,7 +161,7 @@ const DRAWER_GESTURE_OPEN_RATIO = 0.38;
 const DRAWER_GESTURE_CLOSE_RATIO = 0.32;
 const DRAWER_GESTURE_FAST_VELOCITY = 0.42;
 const DRAWER_GESTURE_FAST_MIN_DELTA_X = 36;
-const OPTIMISTIC_MESSAGE_TTL_MS = 45000;
+const OPTIMISTIC_MESSAGE_TTL_MS = 10 * 60 * 1000;
 const MAX_IMAGE_ATTACHMENTS = 4;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_TOTAL_BYTES = 12 * 1024 * 1024;
@@ -1693,7 +1693,7 @@ function renderTranscript() {
 
     const time = document.createElement("span");
     time.className = "timestamp";
-    time.textContent = entry.pending ? "发送中" : formatTime(entry.time);
+    time.textContent = entry.pending ? "发送中" : entry.optimisticConfirmedAt ? "已发送" : formatTime(entry.time);
 
     const body = document.createElement("div");
     body.className = "message-body";
@@ -2327,7 +2327,7 @@ function mergeEntriesWithOptimistic(entries) {
     realEntries.map((entry) => `${entry.role}:${normalizeMessageText(entry.text)}`),
   );
   const activeOptimisticEntries = state.transcript.filter((entry) => {
-    if (!entry.pending) {
+    if (!optimisticMessageIds.has(entry.id)) {
       return false;
     }
 
@@ -2383,6 +2383,7 @@ function finalizeOptimisticMessage(messageId) {
   }
 
   entry.pending = false;
+  entry.optimisticConfirmedAt = new Date().toISOString();
   renderTranscript();
 }
 
