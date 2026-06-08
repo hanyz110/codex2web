@@ -701,6 +701,15 @@ test("provider switch bridge applies only across providers", async () => {
     assert.match(promptParts[0], /上下文恢复包/);
     assert.match(promptParts[0], /DeepSeek阶段新增的关键事实/);
     assert.doesNotMatch(promptParts[1], /上下文恢复包/);
+
+    const logicalTranscriptPath = path.join(tempDir, "claude-logical-transcripts", `${sourceSessionId}.jsonl`);
+    const logicalTranscript = await readFile(logicalTranscriptPath, "utf-8");
+    assert.match(logicalTranscript, /"text":"请继续"/);
+    assert.doesNotMatch(logicalTranscript, /上下文恢复包/);
+
+    const visibleTranscript = await bridge.getTranscript(sourceSessionId);
+    assert.ok(visibleTranscript.some((entry) => entry.role === "user" && entry.text === "请继续"));
+    assert.ok(!visibleTranscript.some((entry) => entry.text.includes("上下文恢复包")));
   } finally {
     if (previousEnv.ANTHROPIC_MODEL == null) {
       delete process.env.ANTHROPIC_MODEL;

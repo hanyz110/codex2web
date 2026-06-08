@@ -857,6 +857,12 @@ function isDeepSeekSafeForkScaffoldText(text) {
   return value.startsWith("这是一个自动创建的 DeepSeek 安全分支。");
 }
 
+function isInternalProviderScaffoldText(text) {
+  const value = trimText(text);
+  return isDeepSeekSafeForkScaffoldText(value)
+    || value.startsWith("以下是同一个 Claude2Web 可见会话在跨 provider 切换后带入的最近上下文恢复包。");
+}
+
 function isDeepSeekSafeForkSession(session) {
   return isDeepSeekSafeForkScaffoldText(session?.name || "");
 }
@@ -1981,7 +1987,8 @@ export class ClaudeReadonlyBridge {
       }
       throw error;
     }
-    const { cursor, transcript } = parsedTranscript;
+    const { cursor } = parsedTranscript;
+    const transcript = parsedTranscript.transcript.filter((entry) => !isInternalProviderScaffoldText(entry.text));
     this.#sessionCursors.set(sessionId, cursor);
     const logicalEntries = await this.#readLogicalTranscript(sessionId);
     const mergedTranscript = mergeTranscriptEntries(transcript, logicalEntries);
@@ -2077,7 +2084,7 @@ export class ClaudeReadonlyBridge {
 
     const logicalEntries = await this.#readLogicalTranscript(sessionId, { limit: HISTORY_TRANSCRIPT_LIMIT });
     const transcript = mergeTranscriptEntriesWithLimit(
-      parsedTranscript.transcript,
+      parsedTranscript.transcript.filter((entry) => !isInternalProviderScaffoldText(entry.text)),
       logicalEntries,
       HISTORY_TRANSCRIPT_LIMIT,
     );
@@ -2225,6 +2232,15 @@ export class ClaudeReadonlyBridge {
       });
       if (target.session.id !== logicalSession.id) {
         await this.#pollSession(target.session);
+      }
+      if (target.providerBridgeApplied) {
+        const logicalProviderBridgeEntryId = `${logicalSession.id}:provider-bridge-user:${result.acceptedAt || nowIso()}`;
+        await this.#appendLogicalTranscriptEntry(logicalSession.id, {
+          id: logicalProviderBridgeEntryId,
+          role: "user",
+          text: trimmed,
+          time: result.acceptedAt || nowIso(),
+        });
       }
       if (target.deepSeekRun?.initializing) {
         await this.#markDeepSeekRunReady(logicalSession.id, target.session.id);
@@ -3290,7 +3306,7 @@ export class ClaudeReadonlyBridge {
 
   async #appendLogicalTranscriptEntry(sessionId, entry) {
     const normalized = normalizeLogicalTranscriptEntry(entry);
-    if (!sessionId || !normalized || isDeepSeekSafeForkScaffoldText(normalized.text)) {
+    if (!sessionId || !normalized || isInternalProviderScaffoldText(normalized.text)) {
       return;
     }
 

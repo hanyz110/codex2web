@@ -3371,6 +3371,10 @@ modelOptionList?.addEventListener("click", (event) => {
 
 async function sendCurrentMessage() {
   if (state.send === "sending" || state.send === "stopping") {
+    setAlert(state.send === "stopping"
+      ? "正在停止上一条指令，请等待停止完成后再发送。"
+      : "上一条指令仍在执行中，请等待完成或先停止执行。");
+    composerInput.focus();
     return;
   }
 
