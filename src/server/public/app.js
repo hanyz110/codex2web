@@ -125,8 +125,10 @@ let snapshotPollMs = 0;
 let snapshotPollTimer = null;
 let completionSnapshotTimer = 0;
 let completionSnapshotKey = "";
+let transcriptScrollFrame = 0;
 let transportWatchdogTimer = null;
 let terminalExecutionBySession = new Map();
+let messageRenderCache = new Map();
 let sessionsLoaded = false;
 let sessionsLoadingPromise = null;
 let sessionSearchQuery = "";
@@ -161,6 +163,7 @@ const DRAWER_EDGE_SWIPE_MAX_WIDTH = 768;
 const DRAWER_EDGE_SWIPE_RIGHT_INSET_PX = 16;
 const DRAWER_EDGE_SWIPE_ZONE_PX = 108;
 const DRAWER_GESTURE_LOCK_DELTA_PX = 8;
+const DRAWER_GESTURE_HORIZONTAL_LOCK_RATIO = 1.45;
 const DRAWER_GESTURE_MIN_DELTA_X = 56;
 const DRAWER_GESTURE_OPEN_RATIO = 0.38;
 const DRAWER_GESTURE_CLOSE_RATIO = 0.32;
@@ -873,6 +876,31 @@ function shouldCollapseMessageText(text) {
   return value.length > LONG_MESSAGE_COLLAPSE_CHARS || (value.match(/\n/g) || []).length > LONG_MESSAGE_COLLAPSE_LINES;
 }
 
+function getMessageRenderCacheKey(entry) {
+  return [
+    entry?.id || "",
+    entry?.role || "",
+    entry?.pending ? "pending" : "ready",
+    entry?.optimisticConfirmedAt || "",
+    String(entry?.text || "").length,
+  ].join(":");
+}
+
+function getRenderedMessageHtml(entry) {
+  const key = getMessageRenderCacheKey(entry);
+  const cached = messageRenderCache.get(key);
+  if (cached) {
+    return cached;
+  }
+
+  const html = renderMessageHtml(entry?.text || "");
+  messageRenderCache.set(key, html);
+  if (messageRenderCache.size > 240) {
+    messageRenderCache = new Map(Array.from(messageRenderCache.entries()).slice(-160));
+  }
+  return html;
+}
+
 function isNearBottom() {
   return transcriptList.scrollHeight - transcriptList.scrollTop - transcriptList.clientHeight < 56;
 }
@@ -885,6 +913,25 @@ function scrollTranscriptToBottom() {
   transcriptList.scrollTop = transcriptList.scrollHeight;
   shouldStickToBottom = true;
   updateJumpToLatestVisibility();
+}
+
+function handleTranscriptScroll() {
+  transcriptScrollFrame = 0;
+  shouldStickToBottom = isNearBottom();
+  updateJumpToLatestVisibility();
+  if (
+    transcriptList.scrollTop <= TRANSCRIPT_HISTORY_TOP_THRESHOLD_PX &&
+    transcriptHistorySessionId === (state.pinnedSessionId || "")
+  ) {
+    void loadOlderTranscriptHistory();
+  }
+}
+
+function scheduleTranscriptScrollHandling() {
+  if (transcriptScrollFrame) {
+    return;
+  }
+  transcriptScrollFrame = window.requestAnimationFrame(handleTranscriptScroll);
 }
 
 function resetDrawerDragStyles() {
@@ -1034,8 +1081,11 @@ function updateDrawerGestureMove({ event, point }) {
     if (horizontal < DRAWER_GESTURE_LOCK_DELTA_PX && vertical < DRAWER_GESTURE_LOCK_DELTA_PX) {
       return;
     }
-    if (vertical > horizontal * 1.05) {
+    if (vertical >= horizontal) {
       drawerGesture = null;
+      return;
+    }
+    if (horizontal < vertical * DRAWER_GESTURE_HORIZONTAL_LOCK_RATIO) {
       return;
     }
     drawerGesture.locked = true;
@@ -1709,9 +1759,12 @@ function renderFlowStatusCard() {
 
   const detail = String(feedback.detail || "").trim();
   const description = detail || execution.summary || "等待执行状态";
-  card.innerHTML = `
-    <p class="flow-status-copy">${escapeHtml(description)}</p>
-  `;
+  if (card.dataset.description !== description) {
+    card.dataset.description = description;
+    card.innerHTML = `
+      <p class="flow-status-copy">${escapeHtml(description)}</p>
+    `;
+  }
 
   if (!existingCard) {
     transcriptList.append(card);
@@ -1766,7 +1819,7 @@ function renderTranscript() {
     if (body.classList.contains("is-long-message-body")) {
       body.textContent = entry.text || "";
     } else {
-      body.innerHTML = renderMessageHtml(entry.text);
+      body.innerHTML = getRenderedMessageHtml(entry);
     }
 
     meta.append(label, time);
@@ -2463,6 +2516,7 @@ function finalizeOptimisticMessage(messageId) {
 
 function replaceTranscript(entries) {
   state.transcript = mergeEntriesWithOptimistic(entries);
+  messageRenderCache.clear();
   seenMessageIds.clear();
   for (const entry of state.transcript) {
     seenMessageIds.add(entry.id);
@@ -2986,16 +3040,7 @@ document.addEventListener("pointermove", handleDrawerPointerMove);
 document.addEventListener("pointerup", handleDrawerPointerEnd);
 document.addEventListener("pointercancel", handleDrawerPointerCancel);
 
-transcriptList?.addEventListener("scroll", () => {
-  shouldStickToBottom = isNearBottom();
-  updateJumpToLatestVisibility();
-  if (
-    transcriptList.scrollTop <= TRANSCRIPT_HISTORY_TOP_THRESHOLD_PX &&
-    transcriptHistorySessionId === (state.pinnedSessionId || "")
-  ) {
-    void loadOlderTranscriptHistory();
-  }
-});
+transcriptList?.addEventListener("scroll", scheduleTranscriptScrollHandling, { passive: true });
 
 transcriptList?.addEventListener("click", async (event) => {
   const target = event.target;
