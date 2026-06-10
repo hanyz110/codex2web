@@ -1606,12 +1606,13 @@ function autoResizeComposer() {
   const viewportHeight = window.visualViewport?.height || window.innerHeight || 800;
   const composerMaxHeight = Math.max(168, Math.min(420, Math.floor(viewportHeight * 0.45)));
   composerInput.style.height = "auto";
+  const scrollHeight = composerInput.scrollHeight;
   const nextHeight = Math.min(
-    Math.max(composerInput.scrollHeight, COMPOSER_MIN_HEIGHT),
+    Math.max(scrollHeight, COMPOSER_MIN_HEIGHT),
     composerMaxHeight,
   );
   composerInput.style.height = `${nextHeight}px`;
-  composerInput.style.overflowY = "hidden";
+  composerInput.style.overflowY = scrollHeight > composerMaxHeight ? "auto" : "hidden";
   syncComposerOffset();
 }
 

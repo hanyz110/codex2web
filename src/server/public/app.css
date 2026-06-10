@@ -1163,7 +1163,9 @@ label {
   min-height: 38px;
   max-height: 46dvh;
   resize: none;
-  overflow-y: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   background: transparent;
   border: none;
   border-radius: 8px;
