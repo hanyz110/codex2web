@@ -592,8 +592,6 @@ h3 {
   border-bottom: 1px solid rgba(203, 213, 225, 0.62);
   width: 100%;
   max-width: 100%;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 180px;
 }
 
 .message:last-child {
@@ -625,8 +623,6 @@ h3 {
   padding: 7px 8px 8px;
   border-bottom: 1px solid rgba(203, 213, 225, 0.62);
   background: linear-gradient(90deg, rgba(15, 23, 42, 0.035), transparent 48%);
-  content-visibility: auto;
-  contain-intrinsic-size: auto 72px;
 }
 
 .flow-status-pills {
