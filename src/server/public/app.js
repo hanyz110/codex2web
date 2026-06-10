@@ -150,8 +150,10 @@ const EXTERNAL_STALE_SNAPSHOT_MS = 6000;
 const EXTERNAL_STALE_RECONNECT_MS = 12000;
 const EXECUTION_NO_OUTPUT_HINT_MS = 8000;
 const EXECUTION_STALLED_HINT_MS = 20000;
-const TRANSCRIPT_HISTORY_PAGE_SIZE = 80;
+const TRANSCRIPT_HISTORY_PAGE_SIZE = 32;
 const TRANSCRIPT_HISTORY_TOP_THRESHOLD_PX = 96;
+const LONG_MESSAGE_COLLAPSE_CHARS = 12000;
+const LONG_MESSAGE_COLLAPSE_LINES = 180;
 const DRAWER_EDGE_SWIPE_MAX_WIDTH = 768;
 const DRAWER_EDGE_SWIPE_RIGHT_INSET_PX = 16;
 const DRAWER_EDGE_SWIPE_ZONE_PX = 108;
@@ -814,6 +816,11 @@ function renderMessageHtml(text) {
       return renderTextBlocks(section);
     })
     .join("");
+}
+
+function shouldCollapseMessageText(text) {
+  const value = String(text || "");
+  return value.length > LONG_MESSAGE_COLLAPSE_CHARS || (value.match(/\n/g) || []).length > LONG_MESSAGE_COLLAPSE_LINES;
 }
 
 function isNearBottom() {
@@ -1698,11 +1705,19 @@ function renderTranscript() {
 
     const body = document.createElement("div");
     body.className = "message-body";
+    if (shouldCollapseMessageText(entry.text)) {
+      item.classList.add("is-long-message");
+      body.classList.add("is-long-message-body");
+    }
     body.setAttribute(
       "title",
       entry.role === "assistant" ? "连续双击复制这条回复" : "只支持复制单条 Assistant 回复",
     );
-    body.innerHTML = renderMessageHtml(entry.text);
+    if (body.classList.contains("is-long-message-body")) {
+      body.textContent = entry.text || "";
+    } else {
+      body.innerHTML = renderMessageHtml(entry.text);
+    }
 
     meta.append(label, time);
     content.append(meta, body);
