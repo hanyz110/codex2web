@@ -742,9 +742,17 @@ test("model selection is shared by session and isolated across sessions", async 
       "  exit 0",
       "fi",
       "input=$(cat)",
+      "prompt=\"$input\"",
+      "for arg in \"$@\"; do prompt=\"$arg\"; done",
       "case \"$input\" in",
       "  *Reply\\ exactly:*)",
       "    printf '%s\\n' \"${input##*Reply exactly: }\"",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "case \"$prompt\" in",
+      "  *Reply\\ exactly:*)",
+      "    printf '%s\\n' \"${prompt##*Reply exactly: }\"",
       "    exit 0",
       "    ;;",
       "esac",
@@ -921,6 +929,131 @@ test("DeepSeek safety execution keeps the pinned logical session", async () => {
     );
     assert.equal(
       restartedSnapshot.entries.some((entry) => entry.role === "assistant" && entry.text === "OK from hidden DeepSeek"),
+      true,
+    );
+  } finally {
+    if (previousEnv.ANTHROPIC_MODEL == null) {
+      delete process.env.ANTHROPIC_MODEL;
+    } else {
+      process.env.ANTHROPIC_MODEL = previousEnv.ANTHROPIC_MODEL;
+    }
+    if (previousEnv.CLAUDE2WEB_DEFAULT_MODEL == null) {
+      delete process.env.CLAUDE2WEB_DEFAULT_MODEL;
+    } else {
+      process.env.CLAUDE2WEB_DEFAULT_MODEL = previousEnv.CLAUDE2WEB_DEFAULT_MODEL;
+    }
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
+test("DeepSeek safety execution persists fork output when physical line ids collide with source session", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "claude2web-hidden-fork-id-collision-"));
+  const sessionRoot = path.join(tempDir, "projects");
+  const projectDir = path.join(sessionRoot, "project");
+  const sourceSessionId = "source-session-collision";
+  const sourceSessionPath = path.join(projectDir, `${sourceSessionId}.jsonl`);
+  const fakeClaude = path.join(tempDir, "claude");
+  await mkdir(projectDir, { recursive: true });
+  await writeFile(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"--help\" ]; then",
+      "  echo \"--model claude-opus-4-8 deepseek-v4-flash\"",
+      "  exit 0",
+      "fi",
+      "input=$(cat)",
+      "prompt=\"$input\"",
+      "for arg in \"$@\"; do prompt=\"$arg\"; done",
+      "case \"$input\" in",
+      "  *Reply\\ exactly:*)",
+      "    printf '%s\\n' \"${input##*Reply exactly: }\"",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "case \"$prompt\" in",
+      "  *Reply\\ exactly:*)",
+      "    printf '%s\\n' \"${prompt##*Reply exactly: }\"",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "session_id=\"\"",
+      "prev=\"\"",
+      "for arg in \"$@\"; do",
+      "  if [ \"$prev\" = \"--session-id\" ]; then session_id=\"$arg\"; fi",
+      "  prev=\"$arg\"",
+      "done",
+      `session_file='${projectDir.replaceAll("'", "'\\''")}/'\"$session_id\"'.jsonl'`,
+      ": > \"$session_file\"",
+      "for index in 1 2 3 4 5 6; do",
+      "  printf '{\"type\":\"queue-operation\",\"operation\":\"noop\",\"timestamp\":\"2026-06-01T00:00:0%s.000Z\",\"sessionId\":\"%s\"}\\n' \"$index\" \"$session_id\" >> \"$session_file\"",
+      "done",
+      "printf '{\"type\":\"assistant\",\"sessionId\":\"%s\",\"timestamp\":\"2026-06-01T00:00:07.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"new DeepSeek answer at colliding line 7\"}]}}\\n' \"$session_id\" >> \"$session_file\"",
+      "printf '{\"type\":\"assistant\",\"sessionId\":\"%s\",\"timestamp\":\"2026-06-01T00:00:07.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"new DeepSeek answer at colliding line 7\"}]}}\\n' \"$session_id\"",
+      "printf '{\"type\":\"result\",\"sessionId\":\"%s\",\"subtype\":\"success\",\"modelUsage\":{\"deepseek-v4-flash\":{\"inputTokens\":1,\"outputTokens\":1}}}\\n' \"$session_id\"",
+    ].join("\n"),
+    "utf-8",
+  );
+  await chmod(fakeClaude, 0o755);
+
+  const sourceRecords = [];
+  for (let index = 1; index <= 6; index += 1) {
+    sourceRecords.push(JSON.stringify({
+      cwd: tempDir,
+      message: { content: [{ text: `source user ${index}`, type: "text" }], role: "user" },
+      sessionId: sourceSessionId,
+      timestamp: `2026-06-01T00:00:0${String(index)}.000Z`,
+      type: "user",
+    }));
+  }
+  sourceRecords.push(JSON.stringify({
+    cwd: tempDir,
+    message: {
+      content: [{ text: "old source assistant at line 7", type: "text" }, { thinking: "hidden", type: "thinking" }],
+      role: "assistant",
+    },
+    sessionId: sourceSessionId,
+    timestamp: "2026-06-01T00:00:07.000Z",
+    type: "assistant",
+  }));
+  await writeFile(sourceSessionPath, sourceRecords.join("\n"), "utf-8");
+
+  const previousEnv = {
+    ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
+    CLAUDE2WEB_DEFAULT_MODEL: process.env.CLAUDE2WEB_DEFAULT_MODEL,
+  };
+  process.env.ANTHROPIC_MODEL = "deepseek-v4-flash";
+  process.env.CLAUDE2WEB_DEFAULT_MODEL = "deepseek-v4-flash";
+
+  try {
+    const bridge = new ClaudeReadonlyBridge({
+      auditFilePath: path.join(tempDir, "audit.jsonl"),
+      claudeBinaryPath: fakeClaude,
+      sendRequested: true,
+      sessionRootPath: sessionRoot,
+      stateFilePath: path.join(tempDir, "state.json"),
+    });
+    await bridge.init();
+
+    const result = await bridge.sendInput("continue with deepseek");
+    assert.equal(result.forked, true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const restartedBridge = new ClaudeReadonlyBridge({
+      auditFilePath: path.join(tempDir, "audit-after-restart.jsonl"),
+      claudeBinaryPath: fakeClaude,
+      sendRequested: true,
+      sessionRootPath: sessionRoot,
+      stateFilePath: path.join(tempDir, "state.json"),
+    });
+    await restartedBridge.init();
+    const restartedSnapshot = await restartedBridge.getTranscriptSnapshot({ forceFull: true });
+    assert.equal(
+      restartedSnapshot.entries.some((entry) => entry.role === "assistant" && entry.text === "old source assistant at line 7"),
+      true,
+    );
+    assert.equal(
+      restartedSnapshot.entries.some((entry) => entry.role === "assistant" && entry.text === "new DeepSeek answer at colliding line 7"),
       true,
     );
   } finally {

@@ -1232,7 +1232,7 @@ function setBadge(kind, value) {
   setText(target, config.text);
 }
 
-function setAlert(message) {
+function setAlert(message, { tone = "" } = {}) {
   if (alertAutoHideTimerId) {
     window.clearTimeout(alertAutoHideTimerId);
     alertAutoHideTimerId = 0;
@@ -1241,11 +1241,17 @@ function setAlert(message) {
   if (!message) {
     setHidden(globalAlert, true);
     setText(globalAlert, "");
+    if (globalAlert) {
+      globalAlert.dataset.tone = "";
+    }
     return;
   }
 
   setHidden(globalAlert, false);
   setText(globalAlert, message);
+  if (globalAlert) {
+    globalAlert.dataset.tone = tone;
+  }
 
   const isErrorLikeAlert = /失败|错误|中断|超时|异常|阻止|停止/i.test(message);
   const autoHideDelay = isErrorLikeAlert ? ALERT_AUTO_HIDE_ERROR_MS : ALERT_AUTO_HIDE_BASE_MS;
@@ -1253,6 +1259,9 @@ function setAlert(message) {
   alertAutoHideTimerId = window.setTimeout(() => {
     setHidden(globalAlert, true);
     setText(globalAlert, "");
+    if (globalAlert) {
+      globalAlert.dataset.tone = "";
+    }
     alertAutoHideTimerId = 0;
   }, autoHideDelay);
 }
@@ -2922,7 +2931,7 @@ function reconnectStream() {
 
     if (hadStreamError && state.connection === "connected") {
       hadStreamError = false;
-      setAlert("连接已恢复，继续使用同一 pinned session。");
+      setAlert("连接成功", { tone: "success" });
       refreshSnapshotPoller();
     }
   });
@@ -2990,7 +2999,7 @@ function reconnectStream() {
     state.stream = "error";
     renderState();
     refreshSnapshotPoller();
-    setAlert("流连接中断，正在自动重连。");
+    setAlert("连接恢复中", { tone: "danger" });
   };
 }
 

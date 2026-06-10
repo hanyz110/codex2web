@@ -950,6 +950,34 @@ function normalizeClaudeRecord(sessionId, record, lineNumber) {
   };
 }
 
+function namespaceLogicalBranchEntryId(entry, sourceSessionId) {
+  if (!entry?.id || !sourceSessionId) {
+    return entry;
+  }
+
+  const parts = String(entry.id).split(":");
+  if (parts.length < 3) {
+    return entry;
+  }
+
+  const [logicalSessionId, ...rest] = parts;
+  return {
+    ...entry,
+    id: `${logicalSessionId}:branch:${sourceSessionId}:${rest.join(":")}`,
+  };
+}
+
+function transcriptContentKey(entry) {
+  if (!entry) {
+    return "";
+  }
+  return [
+    trimText(entry.role),
+    trimText(entry.time),
+    trimText(entry.text),
+  ].join("\u0000");
+}
+
 async function listJsonlFiles(rootPath) {
   const files = [];
   let entries = [];
@@ -1990,6 +2018,7 @@ export class ClaudeReadonlyBridge {
     const { cursor } = parsedTranscript;
     const transcript = parsedTranscript.transcript.filter((entry) => !isInternalProviderScaffoldText(entry.text));
     this.#sessionCursors.set(sessionId, cursor);
+    await this.#syncDeepSeekRunTranscript(sessionId);
     const logicalEntries = await this.#readLogicalTranscript(sessionId);
     const mergedTranscript = mergeTranscriptEntries(transcript, logicalEntries);
     this.#transcriptCache.set(sessionId, mergedTranscript);
@@ -2013,6 +2042,11 @@ export class ClaudeReadonlyBridge {
         latestEntryId: null,
         reset: false,
       };
+    }
+
+    const syncedCount = await this.#syncDeepSeekRunTranscript(sessionId);
+    if (syncedCount > 0) {
+      this.#transcriptCache.delete(sessionId);
     }
 
     let transcript = this.#transcriptCache.get(sessionId);
@@ -3070,10 +3104,13 @@ export class ClaudeReadonlyBridge {
       }
 
       cursor.emittedIds.add(entry.id);
-      transcript.push(entry);
+      const visibleEntry = outputSessionId !== session.id
+        ? namespaceLogicalBranchEntryId(entry, session.id)
+        : entry;
+      transcript.push(visibleEntry);
       if (outputSessionId !== session.id) {
-        await this.#appendLogicalTranscriptEntry(outputSessionId, entry);
-        await this.#advanceDeepSeekRunSyncedEntry(outputSessionId, session.id, entry.id);
+        await this.#appendLogicalTranscriptEntry(outputSessionId, visibleEntry);
+        await this.#advanceDeepSeekRunSyncedEntry(outputSessionId, session.id, visibleEntry.id);
       }
       if (transcript.length > DEFAULT_TRANSCRIPT_LIMIT) {
         transcript.splice(0, transcript.length - DEFAULT_TRANSCRIPT_LIMIT);
@@ -3086,7 +3123,7 @@ export class ClaudeReadonlyBridge {
               detail: entry.toolActivity.detail || "",
               name: entry.toolActivity.name || "工具",
               status: entry.toolActivity.status || "running",
-              summary: entry.toolActivity.summary || entry.text || "",
+              summary: entry.toolActivity.summary || visibleEntry.text || "",
               time: visibleAt,
             }
           : null;
@@ -3108,7 +3145,7 @@ export class ClaudeReadonlyBridge {
             : "Claude 执行中，已收到新的可见输出。",
         }, { emit: false });
       }
-      this.#emit("message", { entry, sessionId: outputSessionId });
+      this.#emit("message", { entry: visibleEntry, sessionId: outputSessionId });
     }
 
     cursor.offset = fileInfo.size;
@@ -3260,6 +3297,67 @@ export class ClaudeReadonlyBridge {
     run.lastSyncedLogicalEntryId = entryId;
     run.updatedAt = nowIso();
     await this.#persistProviderRuns();
+  }
+
+  async #syncDeepSeekRunTranscript(logicalSessionId) {
+    const run = this.#getDeepSeekRun(logicalSessionId);
+    if (!run || !trimText(run.sessionId) || !trimText(run.filePath)) {
+      return 0;
+    }
+
+    let raw;
+    try {
+      raw = await readFile(run.filePath, "utf-8");
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return 0;
+      }
+      throw error;
+    }
+
+    const existingEntries = await this.#readLogicalTranscript(logicalSessionId, { limit: HISTORY_TRANSCRIPT_LIMIT });
+    const existingKeys = new Set(existingEntries.map((entry) => transcriptContentKey(entry)).filter(Boolean));
+    let appendedCount = 0;
+    let latestSyncedEntryId = "";
+    let lineNumber = 0;
+
+    for (const line of raw.split("\n")) {
+      lineNumber += 1;
+      if (!line.trim()) {
+        continue;
+      }
+
+      const record = safeJsonParse(line);
+      if (!record) {
+        continue;
+      }
+
+      const entry = normalizeClaudeRecord(logicalSessionId, record, lineNumber);
+      if (!entry) {
+        continue;
+      }
+
+      const visibleEntry = namespaceLogicalBranchEntryId(entry, run.sessionId);
+      if (isInternalProviderScaffoldText(visibleEntry.text)) {
+        continue;
+      }
+
+      const contentKey = transcriptContentKey(visibleEntry);
+      latestSyncedEntryId = visibleEntry.id;
+      if (!contentKey || existingKeys.has(contentKey)) {
+        continue;
+      }
+
+      await this.#appendLogicalTranscriptEntry(logicalSessionId, visibleEntry);
+      existingKeys.add(contentKey);
+      appendedCount += 1;
+    }
+
+    if (appendedCount > 0 && latestSyncedEntryId) {
+      await this.#advanceDeepSeekRunSyncedEntry(logicalSessionId, run.sessionId, latestSyncedEntryId);
+    }
+
+    return appendedCount;
   }
 
   #getLogicalTranscriptPath(sessionId) {
