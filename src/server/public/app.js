@@ -123,6 +123,8 @@ let transcriptHistorySessionId = "";
 let snapshotPollInFlight = false;
 let snapshotPollMs = 0;
 let snapshotPollTimer = null;
+let completionSnapshotTimer = 0;
+let completionSnapshotKey = "";
 let transportWatchdogTimer = null;
 let terminalExecutionBySession = new Map();
 let sessionsLoaded = false;
@@ -148,6 +150,7 @@ const STREAM_ERROR_SNAPSHOT_POLL_MS = 2000;
 const EXTERNAL_WATCHDOG_INTERVAL_MS = 3000;
 const EXTERNAL_STALE_SNAPSHOT_MS = 6000;
 const EXTERNAL_STALE_RECONNECT_MS = 12000;
+const COMPLETION_SNAPSHOT_DEBOUNCE_MS = 250;
 const EXECUTION_NO_OUTPUT_HINT_MS = 8000;
 const EXECUTION_STALLED_HINT_MS = 20000;
 const TRANSCRIPT_HISTORY_PAGE_SIZE = 32;
@@ -540,6 +543,53 @@ function shouldIgnoreStaleActiveBinding(binding) {
   }
 
   return false;
+}
+
+function shouldRefreshTranscriptAfterCompletion(previousBinding, nextBinding) {
+  if (!isActiveBinding(previousBinding) || isActiveBinding(nextBinding)) {
+    return false;
+  }
+
+  const previousSessionId = getBindingSessionId(previousBinding);
+  const nextSessionId = getBindingSessionId(nextBinding);
+  if (!previousSessionId || previousSessionId !== nextSessionId) {
+    return false;
+  }
+
+  return true;
+}
+
+function scheduleCompletionSnapshot(sessionId, binding) {
+  if (!sessionId) {
+    return;
+  }
+
+  const fingerprint = getExecutionFingerprint(binding);
+  const snapshotKey = [
+    sessionId,
+    binding?.send || "",
+    binding?.executionState?.phase || "",
+    fingerprint.pid,
+    fingerprint.startedAtMs,
+    fingerprint.lastActivityAtMs,
+  ].join(":");
+  if (completionSnapshotKey === snapshotKey) {
+    return;
+  }
+
+  completionSnapshotKey = snapshotKey;
+  if (completionSnapshotTimer) {
+    window.clearTimeout(completionSnapshotTimer);
+  }
+
+  completionSnapshotTimer = window.setTimeout(() => {
+    completionSnapshotTimer = 0;
+    void syncBindingSnapshot({
+      expectedSessionId: sessionId,
+      forceFull: true,
+      silent: true,
+    });
+  }, COMPLETION_SNAPSHOT_DEBOUNCE_MS);
 }
 
 function deriveExecutionFeedback() {
@@ -2276,6 +2326,11 @@ function updateBinding(binding) {
     return false;
   }
 
+  const previousBinding = {
+    executionState: state.executionState,
+    pinnedSessionId: state.pinnedSessionId,
+    send: state.send,
+  };
   const previousSessionId = state.pinnedSessionId || "";
   state.attach = binding.attach;
   state.connection = binding.connection;
@@ -2301,6 +2356,9 @@ function updateBinding(binding) {
   syncFavoriteSessionsFromState();
   renderFavoriteSessions();
   rememberTerminalExecution(binding);
+  if (shouldRefreshTranscriptAfterCompletion(previousBinding, binding)) {
+    scheduleCompletionSnapshot(state.pinnedSessionId, binding);
+  }
   return true;
 }
 
