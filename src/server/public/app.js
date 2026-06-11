@@ -182,6 +182,7 @@ let bootStage = "恢复会话";
 let alertAutoHideTimerId = 0;
 let drawerGesture = null;
 let pendingImages = [];
+let sendRequestInFlight = false;
 
 function createClientId() {
   if (window.crypto?.randomUUID) {
@@ -3499,6 +3500,12 @@ modelOptionList?.addEventListener("click", (event) => {
 });
 
 async function sendCurrentMessage() {
+  if (sendRequestInFlight) {
+    setAlert("上一条指令正在提交，请稍候。");
+    composerInput.focus();
+    return;
+  }
+
   if (state.send === "sending" || state.send === "stopping") {
     setAlert(state.send === "stopping"
       ? "正在停止上一条指令，请等待停止完成后再发送。"
@@ -3526,9 +3533,11 @@ async function sendCurrentMessage() {
 
   const optimisticText = value || "[已附加 " + String(imagesForSend.length) + " 张图片]";
   const optimisticMessageId = appendOptimisticUserMessage(optimisticText, { imageCount: imagesForSend.length });
+  const requestSessionId = state.pinnedSessionId || "";
   composerInput.value = "";
   autoResizeComposer();
 
+  sendRequestInFlight = true;
   state.send = "sending";
   terminalExecutionBySession.delete(state.pinnedSessionId || "");
   state.executionState = {
@@ -3555,17 +3564,45 @@ async function sendCurrentMessage() {
       method: "POST",
     });
   } catch (error) {
+    let serverAcceptedSend = false;
+    try {
+      await syncBindingSnapshot({ expectedSessionId: requestSessionId, forceFull: true, silent: true });
+      const phase = String(state.executionState?.phase || "");
+      serverAcceptedSend = state.pinnedSessionId === requestSessionId && (
+        state.send === "sending" ||
+        state.send === "stopping" ||
+        state.executionState?.processAlive === true ||
+        phase === "starting" ||
+        phase === "running" ||
+        phase === "background"
+      );
+    } catch {
+      serverAcceptedSend = false;
+    }
+
+    if (serverAcceptedSend) {
+      finalizeOptimisticMessage(optimisticMessageId);
+      clearPendingImages();
+      sendRequestInFlight = false;
+      setAlert("指令已发送，正在执行中。");
+      return;
+    }
+
     removeOptimisticMessage(optimisticMessageId);
-    composerInput.value = value;
-    autoResizeComposer();
+    if (!composerInput.value.trim()) {
+      composerInput.value = value;
+      autoResizeComposer();
+    }
     state.send = "error";
     renderState();
     setAlert(error.message);
+    sendRequestInFlight = false;
     return;
   }
 
   finalizeOptimisticMessage(optimisticMessageId);
   clearPendingImages();
+  sendRequestInFlight = false;
 
   try {
     await syncBindingSnapshot({ silent: true });
