@@ -2514,7 +2514,6 @@ function finalizeOptimisticMessage(messageId) {
 
   const entry = state.transcript.find((candidate) => candidate.id === messageId);
   if (!entry) {
-    optimisticMessageIds.delete(messageId);
     seenMessageIds.delete(messageId);
     return;
   }
@@ -2651,8 +2650,9 @@ function reconcileTranscript(entries) {
 
 function getLatestTranscriptId() {
   for (let index = state.transcript.length - 1; index >= 0; index -= 1) {
-    if (!state.transcript[index]?.pending) {
-      return state.transcript[index].id || "";
+    const entry = state.transcript[index];
+    if (entry && !entry.pending && !optimisticMessageIds.has(entry.id)) {
+      return entry.id || "";
     }
   }
 
