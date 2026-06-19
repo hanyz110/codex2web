@@ -852,10 +852,12 @@ function renderMessageHtml(text) {
   return sections
     .map((section, index) => {
       if (index % 2 === 1) {
-        const lines = section.replace(/^\n/, "").split("\n");
-        const language = lines[0]?.trim() || "code";
-        const code = lines.slice(1).join("\n").replace(/\n$/, "");
-        const codeContent = escapeHtml(code || section.trim());
+        const hasLanguageFence = !/^\r?\n/.test(section);
+        const normalizedSection = section.replace(/^\r?\n/, "");
+        const lines = normalizedSection.split("\n");
+        const language = hasLanguageFence ? lines[0]?.trim() || "code" : "code";
+        const code = (hasLanguageFence ? lines.slice(1).join("\n") : normalizedSection).replace(/\n$/, "");
+        const codeContent = escapeHtml(code || normalizedSection.trim());
         return [
           '<div class="code-block">',
           '<div class="code-header">',
