@@ -2526,6 +2526,10 @@ function finalizeOptimisticMessage(messageId) {
 }
 
 function replaceTranscript(entries) {
+  const shouldAutoFollow =
+    state.transcript.length === 0 ||
+    shouldStickToBottom ||
+    isNearBottom();
   state.transcript = mergeEntriesWithOptimistic(entries);
   messageRenderCache.clear();
   seenMessageIds.clear();
@@ -2534,11 +2538,13 @@ function replaceTranscript(entries) {
   }
   transcriptHistoryHasMore = true;
   transcriptHistorySessionId = state.pinnedSessionId || "";
-  shouldStickToBottom = true;
+  shouldStickToBottom = shouldAutoFollow;
   renderTranscript();
   window.requestAnimationFrame(() => {
     if (shouldStickToBottom) {
       scrollTranscriptToBottom();
+    } else {
+      updateJumpToLatestVisibility();
     }
   });
 }
