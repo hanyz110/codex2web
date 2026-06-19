@@ -1185,3 +1185,121 @@ test("DeepSeek safety execution reuses a ready hidden run for consecutive DeepSe
     await rm(tempDir, { force: true, recursive: true });
   }
 });
+
+test("DeepSeek safety execution rolls over oversized hidden run instead of resuming it", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "claude2web-deepseek-rollover-"));
+  const sessionRoot = path.join(tempDir, "projects");
+  const projectDir = path.join(sessionRoot, "project");
+  const sourceSessionId = "rollover-source-session";
+  const sourceSessionPath = path.join(projectDir, `${sourceSessionId}.jsonl`);
+  const fakeClaude = path.join(tempDir, "claude");
+  const promptLog = path.join(tempDir, "prompts.log");
+  await mkdir(projectDir, { recursive: true });
+  await writeFile(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"--help\" ]; then",
+      "  echo \"--model claude-opus-4-8 deepseek-v4-flash\"",
+      "  exit 0",
+      "fi",
+      "input=$(cat)",
+      "prompt=\"$input\"",
+      "for arg in \"$@\"; do prompt=\"$arg\"; done",
+      "case \"$prompt\" in",
+      "  *Reply\\ exactly:*)",
+      "    printf '%s\\n' \"${prompt##*Reply exactly: }\"",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      `printf '%s\\n---PROMPT---\\n' \"$input\" >> '${promptLog.replaceAll("'", "'\\''")}'`,
+      "session_id=\"\"",
+      "prev=\"\"",
+      "for arg in \"$@\"; do",
+      "  if [ \"$prev\" = \"--session-id\" ]; then session_id=\"$arg\"; fi",
+      "  if [ \"$prev\" = \"--resume\" ]; then session_id=\"$arg\"; fi",
+      "  prev=\"$arg\"",
+      "done",
+      `session_file='${projectDir.replaceAll("'", "'\\''")}/'\"$session_id\"'.jsonl'`,
+      "[ -f \"$session_file\" ] || : > \"$session_file\"",
+      "printf '{\"type\":\"assistant\",\"sessionId\":\"%s\",\"timestamp\":\"2026-06-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"OK from %s\"}]}}\\n' \"$session_id\" \"$session_id\" >> \"$session_file\"",
+      "printf '{\"type\":\"assistant\",\"sessionId\":\"%s\",\"timestamp\":\"2026-06-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"OK\"}]}}\\n' \"$session_id\"",
+      "printf '{\"type\":\"result\",\"sessionId\":\"%s\",\"subtype\":\"success\",\"modelUsage\":{\"deepseek-v4-flash\":{\"inputTokens\":1,\"outputTokens\":1}}}\\n' \"$session_id\"",
+    ].join("\n"),
+    "utf-8",
+  );
+  await chmod(fakeClaude, 0o755);
+  await writeFile(
+    sourceSessionPath,
+    [
+      JSON.stringify({
+        cwd: tempDir,
+        message: { content: [{ text: "hello", type: "text" }], role: "user" },
+        sessionId: sourceSessionId,
+        timestamp: "2026-06-01T00:00:00.000Z",
+        type: "user",
+      }),
+      JSON.stringify({
+        cwd: tempDir,
+        message: {
+          content: [{ thinking: "hidden", type: "thinking" }, { text: "visible context before rollover", type: "text" }],
+          role: "assistant",
+        },
+        sessionId: sourceSessionId,
+        timestamp: "2026-06-01T00:00:01.000Z",
+        type: "assistant",
+      }),
+    ].join("\n"),
+    "utf-8",
+  );
+
+  const previousEnv = {
+    ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
+    CLAUDE2WEB_DEFAULT_MODEL: process.env.CLAUDE2WEB_DEFAULT_MODEL,
+  };
+  process.env.ANTHROPIC_MODEL = "deepseek-v4-flash";
+  process.env.CLAUDE2WEB_DEFAULT_MODEL = "deepseek-v4-flash";
+
+  try {
+    const bridge = new ClaudeReadonlyBridge({
+      auditFilePath: path.join(tempDir, "audit.jsonl"),
+      claudeBinaryPath: fakeClaude,
+      sendRequested: true,
+      sessionRootPath: sessionRoot,
+      stateFilePath: path.join(tempDir, "state.json"),
+    });
+    await bridge.init();
+
+    const first = await bridge.sendInput("first deepseek");
+    assert.equal(first.forked, true);
+
+    const providerRuns = JSON.parse(await readFile(path.join(tempDir, "claude-provider-runs.json"), "utf-8"));
+    const firstRun = providerRuns.sessions[sourceSessionId].providers.deepseek;
+    await writeFile(firstRun.filePath, `${"x".repeat(4 * 1024 * 1024 + 1)}\n`, "utf-8");
+
+    const second = await bridge.sendInput("second deepseek after overflow");
+    assert.equal(second.forked, true);
+    assert.equal(second.rollover, true);
+    assert.equal(second.sessionId, sourceSessionId);
+
+    const prompts = await readFile(promptLog, "utf-8");
+    const promptParts = prompts.split("---PROMPT---").map((item) => item.trim()).filter(Boolean);
+    assert.equal(promptParts.length, 2);
+    assert.match(promptParts[0], /这是一个自动创建的 DeepSeek 安全分支/);
+    assert.match(promptParts[1], /这是一个自动创建的 DeepSeek 上下文续接分支/);
+    assert.match(promptParts[1], /visible context before rollover/);
+    assert.match(promptParts[1], /second deepseek after overflow/);
+  } finally {
+    if (previousEnv.ANTHROPIC_MODEL == null) {
+      delete process.env.ANTHROPIC_MODEL;
+    } else {
+      process.env.ANTHROPIC_MODEL = previousEnv.ANTHROPIC_MODEL;
+    }
+    if (previousEnv.CLAUDE2WEB_DEFAULT_MODEL == null) {
+      delete process.env.CLAUDE2WEB_DEFAULT_MODEL;
+    } else {
+      process.env.CLAUDE2WEB_DEFAULT_MODEL = previousEnv.CLAUDE2WEB_DEFAULT_MODEL;
+    }
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});

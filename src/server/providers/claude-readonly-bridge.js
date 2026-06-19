@@ -23,6 +23,10 @@ const SESSION_REFRESH_TTL_MS = 5000;
 const STOP_ESCALATION_TIMEOUT_MS = 3000;
 const RECENT_TRANSCRIPT_ADD_DIR_LIMIT = 8;
 const DEEPSEEK_FORK_CONTEXT_LIMIT = 12;
+const DEEPSEEK_RESUME_MAX_TRANSCRIPT_BYTES = readPositiveInteger(
+  process.env.CLAUDE2WEB_DEEPSEEK_RESUME_MAX_BYTES,
+  4 * 1024 * 1024,
+);
 const PROVIDER_BRIDGE_RECENT_ENTRY_LIMIT = 8;
 const PROVIDER_BRIDGE_CHAR_BUDGET = 6000;
 const PROVIDER_BRIDGE_OPUS_CHAR_BUDGET = 4200;
@@ -73,6 +77,11 @@ function nowIso() {
 function readPositiveDuration(value, fallbackMs) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs;
+}
+
+function readPositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 function trimText(value) {
@@ -857,9 +866,15 @@ function isDeepSeekSafeForkScaffoldText(text) {
   return value.startsWith("这是一个自动创建的 DeepSeek 安全分支。");
 }
 
+function isDeepSeekContextRolloverScaffoldText(text) {
+  const value = trimText(text);
+  return value.startsWith("这是一个自动创建的 DeepSeek 上下文续接分支。");
+}
+
 function isInternalProviderScaffoldText(text) {
   const value = trimText(text);
   return isDeepSeekSafeForkScaffoldText(value)
+    || isDeepSeekContextRolloverScaffoldText(value)
     || value.startsWith("以下是同一个 Claude2Web 可见会话在跨 provider 切换后带入的最近上下文恢复包。");
 }
 
@@ -886,6 +901,34 @@ export function buildDeepSeekSafeForkPrompt({ latestPrompt, sourceSessionId, tra
     `来源 Claude session: ${sourceSessionId || "unknown"}`,
     "",
     "背景：原 session 包含 Claude thinking 历史，DeepSeek Anthropic 兼容接口不能直接 resume。下面提供最近可见对话上下文，请基于这些上下文继续处理用户最新请求。",
+    "",
+    "最近可见上下文：",
+    context,
+    "",
+    "用户最新请求：",
+    trimText(latestPrompt),
+  ].join("\n");
+}
+
+export function buildDeepSeekContextRolloverPrompt({ latestPrompt, previousSessionId, transcript }) {
+  const recentEntries = (Array.isArray(transcript) ? transcript : [])
+    .filter((entry) => trimText(entry?.text))
+    .filter((entry) => !isInternalProviderScaffoldText(entry.text))
+    .slice(-DEEPSEEK_FORK_CONTEXT_LIMIT);
+  const context = recentEntries.length > 0
+    ? recentEntries
+        .map((entry, index) => {
+          const text = trimText(entry.text).slice(0, 4000);
+          return `${index + 1}. ${formatTranscriptRole(entry.role)} (${entry.time || "unknown time"}):\n${text}`;
+        })
+        .join("\n\n")
+    : "无可见历史上下文。";
+
+  return [
+    "这是一个自动创建的 DeepSeek 上下文续接分支。",
+    `上一 DeepSeek session: ${previousSessionId || "unknown"}`,
+    "",
+    "背景：上一 DeepSeek resume 历史已接近模型上下文上限。请基于下面的最近可见对话上下文继续处理用户最新请求；不要要求用户重建会话。",
     "",
     "最近可见上下文：",
     context,
@@ -2247,7 +2290,9 @@ export class ClaudeReadonlyBridge {
       processAlive: false,
       selectedModel: this.#getCurrentModelSelection(logicalSession.id),
       startedAt: nowIso(),
-      statusDetail: target.forked
+      statusDetail: target.rollover
+        ? `上一 DeepSeek 分支已接近上下文上限，已创建续接分支 ${target.session.id.slice(0, 8)}，正在带入最近上下文执行。`
+        : target.forked
         ? `原 session 含 Claude thinking 历史，已创建 DeepSeek 安全分支 ${target.session.id.slice(0, 8)}，正在带入最近上下文执行。`
         : target.providerBridgeApplied
           ? `检测到 provider 从 ${pendingBridge.fromProvider} 切到 ${pendingBridge.toProvider}，已带入最近上下文恢复包，正在启动 Claude resume。`
@@ -2299,6 +2344,7 @@ export class ClaudeReadonlyBridge {
         imageCount: imagePaths.length,
         providerBridgeApplied: Boolean(target.providerBridgeApplied),
         reusedDeepSeekRun: Boolean(target.reusedDeepSeekRun),
+        rollover: Boolean(target.rollover),
       };
     } catch (error) {
       if (target.deepSeekRun?.initializing) {
@@ -2384,20 +2430,18 @@ export class ClaudeReadonlyBridge {
       };
     }
 
-    const thinkingState = await inspectClaudeSessionThinking(session.filePath);
-    if (!thinkingState.hasThinking) {
-      const bridged = await withProviderBridge();
-      return {
-        forked: false,
-        prompt: bridged.prompt,
-        providerBridgeApplied: bridged.applied,
-        session,
-      };
-    }
-
     const transcript = await this.getTranscript(session.id);
     const reusableDeepSeekRun = await this.#getReusableDeepSeekRun(session.id, transcript);
     if (reusableDeepSeekRun) {
+      if (reusableDeepSeekRun.needsRollover) {
+        return await this.#createDeepSeekContextRolloverSession({
+          latestPrompt: prompt,
+          previousRun: reusableDeepSeekRun,
+          session,
+          transcript,
+        });
+      }
+
       const reusedSession = {
         filePath: reusableDeepSeekRun.filePath,
         id: reusableDeepSeekRun.sessionId,
@@ -2421,6 +2465,37 @@ export class ClaudeReadonlyBridge {
         providerBridgeApplied: false,
         reusedDeepSeekRun: true,
         session: reusedSession,
+      };
+    }
+
+    const thinkingState = await inspectClaudeSessionThinking(session.filePath);
+    if (!thinkingState.hasThinking) {
+      try {
+        const fileInfo = await stat(session.filePath);
+        if (fileInfo.size >= DEEPSEEK_RESUME_MAX_TRANSCRIPT_BYTES) {
+          return await this.#createDeepSeekContextRolloverSession({
+            latestPrompt: prompt,
+            previousRun: {
+              filePath: session.filePath,
+              lastSyncedLogicalEntryId: transcript.at(-1)?.id || null,
+              sessionId: session.id,
+              sourcePhysicalSessionId: session.id,
+              size: fileInfo.size,
+            },
+            session,
+            transcript,
+          });
+        }
+      } catch {
+        // If the file disappeared, let the normal Claude CLI error path report it.
+      }
+
+      const bridged = await withProviderBridge();
+      return {
+        forked: false,
+        prompt: bridged.prompt,
+        providerBridgeApplied: bridged.applied,
+        session,
       };
     }
 
@@ -2477,6 +2552,65 @@ export class ClaudeReadonlyBridge {
       logicalSession: session,
       prompt: forkPrompt,
       providerBridgeApplied: false,
+      session: nextSession,
+    };
+  }
+
+  async #createDeepSeekContextRolloverSession({ latestPrompt, previousRun, session, transcript }) {
+    const nextSessionId = randomUUID();
+    const nextSession = {
+      filePath: path.join(path.dirname(session.filePath), `${nextSessionId}.jsonl`),
+      id: nextSessionId,
+      name: `DeepSeek 续接分支 · ${session.name}`,
+      projectPath: session.projectPath,
+      resumePath: session.resumePath,
+      updatedAt: nowIso(),
+    };
+    this.#ephemeralSessionsById.set(nextSession.id, nextSession);
+    this.#sessionsById.set(nextSession.id, nextSession);
+    await this.#setDeepSeekRunInitializing(session.id, {
+      filePath: nextSession.filePath,
+      lastSyncedLogicalEntryId: transcript.at(-1)?.id || previousRun.lastSyncedLogicalEntryId || null,
+      sessionId: nextSession.id,
+      sourcePhysicalSessionId: previousRun.sourcePhysicalSessionId || session.id,
+    });
+
+    const prompt = buildDeepSeekContextRolloverPrompt({
+      latestPrompt,
+      previousSessionId: previousRun.sessionId,
+      transcript,
+    });
+    const detail = `上一 DeepSeek 分支 ${previousRun.sessionId.slice(0, 8)} 已接近上下文上限，已自动创建续接分支 ${nextSession.id.slice(0, 8)}，并带入最近 ${String(Math.min(transcript.length, DEEPSEEK_FORK_CONTEXT_LIMIT))} 条可见上下文继续执行。`;
+    this.#recordAudit({
+      action: "deepseek_context_rollover",
+      detail,
+      nextSessionId: nextSession.id,
+      prevSessionId: previousRun.sessionId,
+    });
+    this.#setExecutionState(session.id, {
+      acceptedAt: null,
+      exitCode: null,
+      lastActivityAt: nowIso(),
+      lastVisibleMessageAt: null,
+      actualModel: null,
+      modelUsage: null,
+      modelUsageModels: [],
+      phase: "starting",
+      pid: null,
+      processAlive: false,
+      selectedModel: this.#getCurrentModelSelection(session.id),
+      startedAt: nowIso(),
+      statusDetail: detail,
+    }, { emit: false });
+    this.#emit("state", this.getBinding(session.id));
+
+    return {
+      deepSeekRun: { initializing: true, rollover: true },
+      forked: true,
+      logicalSession: session,
+      prompt,
+      providerBridgeApplied: false,
+      rollover: true,
       session: nextSession,
     };
   }
@@ -3214,13 +3348,24 @@ export class ClaudeReadonlyBridge {
       return null;
     }
 
+    let fileInfo;
     try {
-      await stat(run.filePath);
+      fileInfo = await stat(run.filePath);
     } catch {
       return null;
     }
 
     const latestEntryId = Array.isArray(transcript) ? transcript.at(-1)?.id || null : null;
+    if (fileInfo.size >= DEEPSEEK_RESUME_MAX_TRANSCRIPT_BYTES) {
+      return {
+        ...run,
+        filePath: run.filePath,
+        needsRollover: true,
+        size: fileInfo.size,
+        sessionId: run.sessionId,
+      };
+    }
+
     if (latestEntryId && run.lastSyncedLogicalEntryId && latestEntryId !== run.lastSyncedLogicalEntryId) {
       return null;
     }
@@ -3228,6 +3373,8 @@ export class ClaudeReadonlyBridge {
     return {
       ...run,
       filePath: run.filePath,
+      needsRollover: false,
+      size: fileInfo.size,
       sessionId: run.sessionId,
     };
   }
