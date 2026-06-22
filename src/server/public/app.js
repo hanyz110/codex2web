@@ -113,9 +113,13 @@ let sessionsLoaded = false;
 let sessionsLoadingPromise = null;
 let favoriteSessions = new Map();
 let lastMessageCopyTap = { at: 0, messageId: "" };
+let transcriptHistoryLoading = false;
+let transcriptHistoryHasMore = true;
+let transcriptHistorySessionId = "";
 const COMPOSER_MIN_HEIGHT = 38;
 const DRAWER_CLOSE_TRANSITION_MS = 240;
 const MIN_OPERATION_LOADING_MS = 300;
+const CLIENT_ID_STORAGE_KEY = "codex2web.clientId.v1";
 const FAVORITE_STORAGE_KEY = "codex2web.sessionFavorites.v1";
 const REQUEST_TIMEOUT_MS = 12000;
 const BOOT_LOADING_MAX_MS = 15000;
@@ -131,6 +135,8 @@ const EXTERNAL_STALE_SNAPSHOT_MS = 6000;
 const EXTERNAL_STALE_RECONNECT_MS = 12000;
 const EXECUTION_NO_OUTPUT_HINT_MS = 8000;
 const EXECUTION_STALLED_HINT_MS = 20000;
+const TRANSCRIPT_HISTORY_PAGE_SIZE = 80;
+const TRANSCRIPT_HISTORY_TOP_THRESHOLD_PX = 96;
 const DRAWER_EDGE_SWIPE_MAX_WIDTH = 768;
 const DRAWER_EDGE_SWIPE_RIGHT_INSET_PX = 16;
 const DRAWER_EDGE_SWIPE_ZONE_PX = 108;
@@ -153,6 +159,29 @@ let bootStage = "恢复会话";
 let alertAutoHideTimerId = 0;
 let drawerGesture = null;
 let pendingImages = [];
+
+function createClientId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `client-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function getClientId() {
+  try {
+    const existing = window.localStorage.getItem(CLIENT_ID_STORAGE_KEY);
+    if (existing) {
+      return existing;
+    }
+    const next = createClientId();
+    window.localStorage.setItem(CLIENT_ID_STORAGE_KEY, next);
+    return next;
+  } catch {
+    return createClientId();
+  }
+}
+
+const clientId = getClientId();
 
 function setText(target, value) {
   if (target) {
@@ -1433,12 +1462,13 @@ function autoResizeComposer() {
   const viewportHeight = window.visualViewport?.height || window.innerHeight || 800;
   const composerMaxHeight = Math.max(168, Math.min(420, Math.floor(viewportHeight * 0.45)));
   composerInput.style.height = "auto";
+  const contentHeight = Math.max(composerInput.scrollHeight, COMPOSER_MIN_HEIGHT);
   const nextHeight = Math.min(
-    Math.max(composerInput.scrollHeight, COMPOSER_MIN_HEIGHT),
+    contentHeight,
     composerMaxHeight,
   );
   composerInput.style.height = `${nextHeight}px`;
-  composerInput.style.overflowY = "hidden";
+  composerInput.style.overflowY = contentHeight > composerMaxHeight ? "auto" : "hidden";
   syncComposerOffset();
 }
 
@@ -1916,6 +1946,7 @@ function renderState() {
 }
 
 function updateBinding(binding) {
+  const previousSessionId = state.pinnedSessionId || "";
   state.attach = binding.attach;
   state.connection = binding.connection;
   state.executionState = binding.executionState || null;
@@ -1924,6 +1955,11 @@ function updateBinding(binding) {
   state.pinnedSessionId = binding.pinnedSessionId || "";
   state.sessionName = binding.session?.name || "未绑定真实会话";
   state.sessionProjectPath = binding.session?.projectPath || "unknown";
+  if (previousSessionId !== state.pinnedSessionId) {
+    transcriptHistoryHasMore = true;
+    transcriptHistoryLoading = false;
+    transcriptHistorySessionId = state.pinnedSessionId || "";
+  }
 
   const projectLabel = basename(state.sessionProjectPath);
 
@@ -1945,8 +1981,85 @@ function replaceTranscript(entries) {
       optimisticMessageIds.add(entry.id);
     }
   }
+  transcriptHistoryHasMore = true;
+  transcriptHistorySessionId = state.pinnedSessionId || "";
   shouldStickToBottom = true;
   renderTranscript();
+}
+
+function getOldestTranscriptId() {
+  for (const entry of state.transcript) {
+    if (!entry?.pending) {
+      return entry.id || "";
+    }
+  }
+
+  return "";
+}
+
+function prependTranscriptHistory(entries) {
+  const olderEntries = Array.isArray(entries)
+    ? entries.filter((entry) => entry?.id && !seenMessageIds.has(entry.id))
+    : [];
+  if (olderEntries.length === 0 || !transcriptList) {
+    return;
+  }
+
+  const previousScrollHeight = transcriptList.scrollHeight;
+  const previousScrollTop = transcriptList.scrollTop;
+  for (const entry of olderEntries) {
+    seenMessageIds.add(entry.id);
+  }
+  state.transcript = [...olderEntries, ...state.transcript];
+  shouldStickToBottom = false;
+  renderTranscript();
+  window.requestAnimationFrame(() => {
+    transcriptList.scrollTop = transcriptList.scrollHeight - previousScrollHeight + previousScrollTop;
+    updateJumpToLatestVisibility();
+  });
+}
+
+async function loadOlderTranscriptHistory() {
+  if (transcriptHistoryLoading || !transcriptHistoryHasMore || state.transcript.length === 0) {
+    return;
+  }
+
+  const beforeId = getOldestTranscriptId();
+  if (!beforeId) {
+    transcriptHistoryHasMore = false;
+    return;
+  }
+
+  const requestSessionId = state.pinnedSessionId || "";
+  transcriptHistoryLoading = true;
+  transcriptList?.setAttribute("aria-busy", "true");
+  try {
+    const payload = await requestJson(
+      `/api/session/history?before=${encodeURIComponent(beforeId)}&limit=${TRANSCRIPT_HISTORY_PAGE_SIZE}&_ts=${Date.now()}`,
+    );
+    const nextBinding = requireBinding(payload.binding, "历史记录加载");
+    const payloadSessionId = nextBinding.pinnedSessionId || "";
+    if (
+      requestSessionId &&
+      ((state.pinnedSessionId && state.pinnedSessionId !== requestSessionId) ||
+        (payloadSessionId && payloadSessionId !== requestSessionId))
+    ) {
+      return;
+    }
+
+    updateBinding(nextBinding);
+    const history = payload.history || {};
+    prependTranscriptHistory(Array.isArray(history.entries) ? history.entries : []);
+    transcriptHistoryHasMore = Boolean(history.hasMore);
+    transcriptHistorySessionId = state.pinnedSessionId || "";
+  } catch (error) {
+    setAlert(error.message);
+  } finally {
+    transcriptHistoryLoading = false;
+    if (operationLoadingCount === 0) {
+      transcriptList?.setAttribute("aria-busy", "false");
+    }
+  }
 }
 
 function reconcileTranscript(entries) {
@@ -2000,6 +2113,18 @@ function appendMessage(entry) {
   seenMessageIds.add(entry.id);
   state.transcript.push(entry);
   renderTranscript();
+}
+
+function resolveApiUrl(url) {
+  return new URL(url, window.location.origin).toString();
+}
+
+function parseJsonResponseText(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 function normalizeMessageText(value) {
@@ -2087,16 +2212,31 @@ function removeOptimisticMessage(messageId) {
 async function requestJson(url, options) {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const requestUrl = resolveApiUrl(url);
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch(requestUrl, {
       ...options,
       cache: "no-store",
+      credentials: "include",
+      headers: {
+        ...(options?.headers || {}),
+        "x-codex2web-client-id": clientId,
+      },
       signal: controller.signal,
     });
-    const payload = await response.json().catch(() => null);
+    const contentType = response.headers.get("content-type") || "";
+    const responseText = await response.text();
+    const payload = responseText ? parseJsonResponseText(responseText) : null;
     if (payload == null) {
-      throw new Error("服务返回了非 JSON 响应，可能是鉴权或穿透链路异常，请刷新页面重试。");
+      const preview = responseText.trim().replace(/\s+/g, " ").slice(0, 120);
+      const detail = [
+        `HTTP ${String(response.status)}`,
+        new URL(requestUrl).pathname,
+        contentType ? `content-type=${contentType}` : "",
+        preview ? `body=${preview}` : "",
+      ].filter(Boolean).join(" · ");
+      throw new Error(`服务返回了非 JSON 响应：${detail}。请刷新页面重试。`);
     }
     if (!response.ok || payload.ok === false) {
       const message = payload?.error?.message || "请求失败";
@@ -2288,7 +2428,12 @@ function reconnectStream() {
     stream.close();
   }
 
-  stream = new EventSource("/api/session/stream");
+  const afterId = encodeURIComponent(getLatestTranscriptId());
+  const clientParam = `clientId=${encodeURIComponent(clientId)}`;
+  const streamUrl = afterId
+    ? `/api/session/stream?after=${afterId}&${clientParam}`
+    : `/api/session/stream?${clientParam}`;
+  stream = new EventSource(resolveApiUrl(streamUrl));
   state.connection = "connecting";
   renderState();
 
@@ -2431,6 +2576,12 @@ document.addEventListener("pointercancel", handleDrawerPointerCancel);
 transcriptList?.addEventListener("scroll", () => {
   shouldStickToBottom = isNearBottom();
   updateJumpToLatestVisibility();
+  if (
+    transcriptList.scrollTop <= TRANSCRIPT_HISTORY_TOP_THRESHOLD_PX &&
+    transcriptHistorySessionId === (state.pinnedSessionId || "")
+  ) {
+    void loadOlderTranscriptHistory();
+  }
 });
 
 transcriptList?.addEventListener("click", async (event) => {
@@ -2606,6 +2757,7 @@ async function attachSessionById(sessionId, switchButton, sessionLabel) {
       forceFull: true,
       silent: true,
     });
+    reconnectStream();
     setAlert("");
     jumpToChatView();
   } catch (error) {

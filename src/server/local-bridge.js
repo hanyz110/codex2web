@@ -11,6 +11,7 @@ const CODEX_BINARY_CANDIDATES = [
   path.join(os.homedir(), ".bun", "bin", "codex"),
 ];
 const DEFAULT_TRANSCRIPT_LIMIT = 300;
+const HISTORY_TRANSCRIPT_LIMIT = 3000;
 const FIRST_JSONL_RECORD_READ_BYTES = 64 * 1024;
 const TRANSCRIPT_TAIL_INITIAL_READ_BYTES = 512 * 1024;
 const TRANSCRIPT_TAIL_MAX_READ_BYTES = 24 * 1024 * 1024;
@@ -32,6 +33,7 @@ const EXECUTION_MAX_RUNTIME_MS = readPositiveDuration(
   process.env.CODEX2WEB_MAX_EXECUTION_MS,
   45 * 60 * 1000,
 );
+const TRANSCRIPT_DUPLICATE_WINDOW_MS = 2000;
 
 export class BridgeError extends Error {
   constructor(statusCode, message, code) {
@@ -53,6 +55,48 @@ function readPositiveDuration(value, fallbackMs) {
 
 function trimText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeTranscriptText(value) {
+  return trimText(value).replace(/\s+/g, " ");
+}
+
+function parseEntryTime(value) {
+  const timestamp = Date.parse(value || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function isDuplicateTranscriptEntry(left, right) {
+  if (!left || !right) {
+    return false;
+  }
+
+  if (left.role !== right.role) {
+    return false;
+  }
+
+  if (normalizeTranscriptText(left.text) !== normalizeTranscriptText(right.text)) {
+    return false;
+  }
+
+  const leftTime = parseEntryTime(left.time);
+  const rightTime = parseEntryTime(right.time);
+  return leftTime > 0 && rightTime > 0 && Math.abs(leftTime - rightTime) <= TRANSCRIPT_DUPLICATE_WINDOW_MS;
+}
+
+function hasRecentDuplicateTranscriptEntry(entries, candidate) {
+  const recentEntries = entries.slice(-8);
+  return recentEntries.some((entry) => isDuplicateTranscriptEntry(entry, candidate));
+}
+
+function dedupeTranscriptEntries(entries) {
+  const deduped = [];
+  for (const entry of entries) {
+    if (!hasRecentDuplicateTranscriptEntry(deduped, entry)) {
+      deduped.push(entry);
+    }
+  }
+  return deduped;
 }
 
 function normalizePath(value) {
@@ -283,7 +327,7 @@ async function readJsonlSlice(filePath, offset, length) {
   }
 }
 
-async function readTranscriptTail(filePath, fileSize) {
+async function readTranscriptTail(filePath, fileSize, minimumLineCount = DEFAULT_TRANSCRIPT_LIMIT * 3) {
   const maxReadBytes = Math.min(fileSize, TRANSCRIPT_TAIL_MAX_READ_BYTES);
   let readBytes = Math.min(fileSize, TRANSCRIPT_TAIL_INITIAL_READ_BYTES);
 
@@ -293,7 +337,7 @@ async function readTranscriptTail(filePath, fileSize) {
     const lines = raw.split("\n").filter((line) => line.trim());
     if (
       offset === 0 ||
-      lines.length >= DEFAULT_TRANSCRIPT_LIMIT * 3 ||
+      lines.length >= minimumLineCount ||
       readBytes >= maxReadBytes
     ) {
       return { offset, raw };
@@ -337,9 +381,10 @@ async function loadSessionIndex(indexPath) {
   return metadata;
 }
 
-async function parseTranscriptFile(session) {
+async function parseTranscriptFile(session, { limit = DEFAULT_TRANSCRIPT_LIMIT } = {}) {
   const fileInfo = await stat(session.filePath);
-  const { offset, raw } = await readTranscriptTail(session.filePath, fileInfo.size);
+  const safeLimit = Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : DEFAULT_TRANSCRIPT_LIMIT);
+  const { offset, raw } = await readTranscriptTail(session.filePath, fileInfo.size, safeLimit * 3);
   const records = [];
   const startsAtBeginning = offset === 0;
   let lineNumber = startsAtBeginning ? 0 : offset;
@@ -374,7 +419,7 @@ async function parseTranscriptFile(session) {
     }
   }
 
-  const trimmed = transcript.slice(-DEFAULT_TRANSCRIPT_LIMIT);
+  const trimmed = dedupeTranscriptEntries(transcript).slice(-safeLimit);
   return {
     cursor: {
       emittedIds: new Set(trimmed.map((entry) => entry.id)),
@@ -385,6 +430,25 @@ async function parseTranscriptFile(session) {
     },
     transcript: trimmed,
   };
+}
+
+function findTranscriptAnchorIndex(entries, anchor) {
+  if (!anchor) {
+    return -1;
+  }
+
+  const byId = entries.findIndex((entry) => entry.id === anchor.id);
+  if (byId >= 0) {
+    return byId;
+  }
+
+  const anchorText = trimText(anchor.text);
+  return entries.findIndex(
+    (entry) =>
+      entry.role === anchor.role &&
+      trimText(entry.text) === anchorText &&
+      String(entry.time || "") === String(anchor.time || ""),
+  );
 }
 
 export class LocalSessionBridge {
@@ -710,14 +774,15 @@ export class LocalSessionBridge {
     this.#emit("state", this.getBinding());
   }
 
-  getBinding() {
-    const session = this.#getSession(this.#pinnedSessionId);
+  getBinding(sessionId = this.#pinnedSessionId) {
+    const effectiveSessionId = trimText(sessionId) || this.#pinnedSessionId;
+    const session = this.#getSession(effectiveSessionId);
     const connection = this.#failureModes.connection ? "error" : "connected";
     const attach = this.#failureModes.attach || !session ? "error" : "attached";
     const stream = this.#failureModes.connection ? "idle" : "streaming";
-    const stopStatus = this.#getStopStatus(this.#pinnedSessionId);
-    const executionState = this.#getExecutionState(this.#pinnedSessionId);
-    const isSending = this.#sendingSessionIds.has(this.#pinnedSessionId);
+    const stopStatus = this.#getStopStatus(effectiveSessionId);
+    const executionState = this.#getExecutionState(effectiveSessionId);
+    const isSending = this.#sendingSessionIds.has(effectiveSessionId);
     const send = this.#failureModes.send
       ? "error"
       : executionState?.phase === "failed"
@@ -737,7 +802,7 @@ export class LocalSessionBridge {
       connection,
       execution: this.getExecutionPolicy(),
       executionState,
-      pinnedSessionId: this.#pinnedSessionId,
+      pinnedSessionId: effectiveSessionId,
       send,
       session: session ? this.#toPublicSession(session) : null,
       stream,
@@ -846,7 +911,48 @@ export class LocalSessionBridge {
     };
   }
 
-  async attachSession(sessionId, explicit) {
+  async getTranscriptHistoryPage({ beforeId = "", limit = 80, sessionId = this.#pinnedSessionId } = {}) {
+    if (!sessionId || !beforeId) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: null,
+      };
+    }
+
+    await this.#refreshSessions();
+    const session = this.#getSession(sessionId);
+    if (!session) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: null,
+      };
+    }
+
+    const safeLimit = Math.max(1, Math.min(200, Number.isFinite(Number(limit)) ? Math.floor(Number(limit)) : 80));
+    const visibleTranscript = this.#transcriptCache.get(sessionId) || (await this.getTranscript(sessionId));
+    const visibleAnchor = visibleTranscript.find((entry) => entry.id === beforeId) || { id: beforeId };
+    const { transcript } = await parseTranscriptFile(session, { limit: HISTORY_TRANSCRIPT_LIMIT });
+    const anchorIndex = findTranscriptAnchorIndex(transcript, visibleAnchor);
+    if (anchorIndex <= 0) {
+      return {
+        entries: [],
+        hasMore: false,
+        oldestEntryId: transcript[0]?.id || null,
+      };
+    }
+
+    const startIndex = Math.max(0, anchorIndex - safeLimit);
+    const entries = transcript.slice(startIndex, anchorIndex);
+    return {
+      entries: entries.map((entry) => ({ ...entry })),
+      hasMore: startIndex > 0,
+      oldestEntryId: transcript[0]?.id || null,
+    };
+  }
+
+  async attachSession(sessionId, explicit, options = {}) {
     if (explicit !== true) {
       throw new BridgeError(
         400,
@@ -862,8 +968,10 @@ export class LocalSessionBridge {
     }
 
     const previousPinnedSessionId = this.#pinnedSessionId;
-    this.#pinnedSessionId = target.id;
-    await this.#persistPinnedSessionId();
+    if (options.persist !== false) {
+      this.#pinnedSessionId = target.id;
+      await this.#persistPinnedSessionId();
+    }
     this.#recordAudit({
       action: "session_switch",
       detail: "User explicitly switched the pinned local Codex session.",
@@ -875,9 +983,9 @@ export class LocalSessionBridge {
       session: this.#toPublicSession(target),
       updatedAt: nowIso(),
     });
-    this.#emit("state", this.getBinding());
+    this.#emit("state", this.getBinding(options.persist === false ? target.id : undefined));
 
-    return this.getBinding();
+    return this.getBinding(options.persist === false ? target.id : undefined);
   }
 
   async sendInput(message, options = {}) {
@@ -898,7 +1006,8 @@ export class LocalSessionBridge {
     }
 
     await this.#refreshSessions(true);
-    const session = this.#getSession(this.#pinnedSessionId);
+    const targetSessionId = trimText(options?.sessionId) || this.#pinnedSessionId;
+    const session = this.#getSession(targetSessionId);
     if (this.#failureModes.attach || !session) {
       throw new BridgeError(409, "Pinned session is not attached.", "SESSION_ATTACH_ERROR");
     }
@@ -950,9 +1059,10 @@ export class LocalSessionBridge {
     }
   }
 
-  async stopInput() {
+  async stopInput(options = {}) {
     await this.#refreshSessions(true);
-    const session = this.#getSession(this.#pinnedSessionId);
+    const targetSessionId = trimText(options?.sessionId) || this.#pinnedSessionId;
+    const session = this.#getSession(targetSessionId);
     if (this.#failureModes.attach || !session) {
       throw new BridgeError(409, "Pinned session is not attached.", "SESSION_ATTACH_ERROR");
     }
@@ -1334,6 +1444,10 @@ export class LocalSessionBridge {
       }
 
       cursor.emittedIds.add(entry.id);
+      if (hasRecentDuplicateTranscriptEntry(transcript, entry)) {
+        continue;
+      }
+
       transcript.push(entry);
       if (transcript.length > DEFAULT_TRANSCRIPT_LIMIT) {
         transcript.splice(0, transcript.length - DEFAULT_TRANSCRIPT_LIMIT);
