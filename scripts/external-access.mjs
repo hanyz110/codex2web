@@ -530,28 +530,58 @@ async function main() {
   });
   process.env.PATH = serviceEnv.PATH;
 
-  const serverChild = spawn(process.execPath, ["src/server/dev-server.js"], {
-    env: {
-      ...serviceEnv,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  streamChild("server", serverChild);
   let tunnelCleanupPaths = [];
   let isShuttingDown = false;
   let plannedTunnelRestart = false;
+  let serverChild = null;
+  let tunnelChild = null;
+
+  function spawnServerChild() {
+    const child = spawn(process.execPath, ["src/server/dev-server.js"], {
+      env: {
+        ...serviceEnv,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    serverChild = child;
+    streamChild("server", child);
+    child.on("close", (code, signal) => {
+      if (isShuttingDown || serverChild !== child) {
+        return;
+      }
+      void restartServerChild(code, signal);
+    });
+    return child;
+  }
+
+  async function restartServerChild(code, signal) {
+    process.stderr.write(
+      `[watchdog] server exited unexpectedly with code ${String(code)} signal ${String(signal)}; restarting server only.\n`,
+    );
+    serverChild = null;
+    spawnServerChild();
+    try {
+      await waitForLocalReady(port, basicUser, basicPass);
+      process.stderr.write("[watchdog] server restart completed.\n");
+    } catch (error) {
+      process.stderr.write(
+        `[watchdog] server restart did not become ready yet; keeping launchd job alive: ${String(
+          error.message || error,
+        )}\n`,
+      );
+    }
+  }
 
   const cleanup = () => {
     isShuttingDown = true;
-    serverChild.kill("SIGTERM");
+    if (serverChild) {
+      serverChild.kill("SIGTERM");
+    }
     if (tunnelChild) {
       tunnelChild.kill("SIGTERM");
     }
     void cleanupPaths(tunnelCleanupPaths);
   };
-
-  let tunnelChild = null;
 
   process.on("SIGINT", () => {
     cleanup();
@@ -563,6 +593,7 @@ async function main() {
   });
   process.on("exit", cleanup);
 
+  spawnServerChild();
   const meta = await waitForLocalReady(port, basicUser, basicPass);
   const tunnelCommand = await buildTunnelCommand(provider, port, namedTunnelOptions);
   tunnelCleanupPaths = tunnelCommand.cleanupPaths || [];
@@ -673,14 +704,7 @@ async function main() {
     user: basicUser,
   });
 
-  await Promise.race([
-    new Promise((resolve, reject) => {
-      serverChild.on("close", (code) => {
-        reject(new Error(`External server exited unexpectedly with code ${String(code)}.`));
-      });
-    }),
-    new Promise(() => {}),
-  ]);
+  await new Promise(() => {});
 }
 
 main().catch((error) => {
