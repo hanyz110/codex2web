@@ -5,11 +5,14 @@ import { appendFile, mkdir, open, readFile, readdir, stat, writeFile } from "nod
 import os from "node:os";
 import path from "node:path";
 
-const CODEX_BINARY_CANDIDATES = [
-  "/Applications/Codex.app/Contents/Resources/codex",
-  path.join(os.homedir(), ".nvm", "versions", "node", "v22.20.0", "bin", "codex"),
-  path.join(os.homedir(), ".bun", "bin", "codex"),
-];
+export function getDefaultCodexBinaryCandidates(homeDir = os.homedir()) {
+  return [
+    "/Applications/Codex.app/Contents/Resources/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    path.join(homeDir, ".nvm", "versions", "node", "v22.20.0", "bin", "codex"),
+    path.join(homeDir, ".bun", "bin", "codex"),
+  ];
+}
 const DEFAULT_TRANSCRIPT_LIMIT = 300;
 const HISTORY_TRANSCRIPT_LIMIT = 3000;
 const FIRST_JSONL_RECORD_READ_BYTES = 64 * 1024;
@@ -171,7 +174,7 @@ function getCodexBinaryVersion(binaryPath) {
 
 function resolveDefaultCodexBinary() {
   let selected = null;
-  for (const candidate of CODEX_BINARY_CANDIDATES) {
+  for (const candidate of getDefaultCodexBinaryCandidates()) {
     const version = getCodexBinaryVersion(candidate);
     if (!version) {
       continue;
