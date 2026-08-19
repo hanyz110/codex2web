@@ -108,7 +108,8 @@
 
             <form id="composerForm" class="composer-form" novalidate>
               <label class="sr-only" for="composerInput">下一条指令</label>
-              <div id="imagePreviewList" class="image-preview-list" aria-label="待发送图片" hidden></div>
+              <p class="composer-drop-hint" aria-hidden="true">松开鼠标即可添加附件</p>
+              <div id="attachmentPreviewList" class="attachment-preview-list" aria-label="待发送附件" hidden></div>
               <div class="composer-row">
                 <textarea
                   id="composerInput"
@@ -155,15 +156,18 @@
                       <button class="quick-command-item" type="button" role="menuitem" data-quick-command="验收issue">
                         验收issue
                       </button>
+                      <button id="quickAttachFilesButton" class="quick-command-item" type="button" role="menuitem">
+                        添加文件附件
+                      </button>
                     </div>
                   </div>
-                  <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+                  <input id="attachmentInput" type="file" multiple hidden />
                   <button
                     id="attachImageButton"
                     class="icon-button composer-attach"
                     type="button"
-                    aria-label="添加图片"
-                    aria-controls="imagePreviewList"
+                    aria-label="添加附件"
+                    aria-controls="attachmentPreviewList"
                   >
                     <svg viewBox="0 0 24 24" aria-hidden="true">
                       <path

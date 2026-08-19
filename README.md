@@ -95,20 +95,23 @@ Defaults:
 2. external mode defaults to `full-auto`
 3. external `dangerous` is blocked unless you explicitly enable `--remote-trusted`
 
-## Image Prompts
+## File Attachments
 
-The chat composer supports sending prompt text with image attachments in the same turn.
+The chat composer supports sending prompt text with multiple file attachments in the same turn.
+
+Files can be added from the `+` menu, the attachment button, or by dragging them into the composer. Images continue to use Codex CLI image input; other files are stored in the local private upload directory and their paths are added to the prompt so Codex can inspect them when needed.
 
 Large phone photos are compressed in the browser before upload. The preview shows the original and compressed sizes when compression happens.
 
 Limits:
 
-1. supported formats: PNG, JPEG, WebP, GIF
-2. maximum images per send: 4
-3. maximum single image size: 5MB
-4. maximum total image size per send: 12MB
+1. images: PNG, JPEG, WebP, GIF
+2. maximum attachments per send: 10
+3. maximum single file size: 20MB; maximum single image size: 5MB
+4. maximum total attachment size per send: 50MB
+5. maximum total image size per send: 12MB
 
-Images are stored locally under `.codex2web/uploads/` and passed to Codex CLI with `--image <file>`. They are not committed to git because `.codex2web/` is ignored.
+Attachments are stored locally under `.codex2web/uploads/`. Images are passed to Codex CLI with `--image <file>`; other files are referenced by their private local path in the prompt. They are not committed to git because `.codex2web/` is ignored.
 
 ## External Access
 

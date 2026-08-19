@@ -993,6 +993,7 @@ export class LocalSessionBridge {
 
   async sendInput(message, options = {}) {
     const trimmed = trimText(message);
+    const attachmentPrompt = trimText(options?.attachmentPrompt) || trimmed;
     const imagePaths = Array.isArray(options?.imagePaths)
       ? options.imagePaths.map((filePath) => normalizePath(filePath)).filter(Boolean)
       : [];
@@ -1049,7 +1050,7 @@ export class LocalSessionBridge {
     this.#emit("state", this.getBinding());
 
     try {
-      const result = await this.#startResumeProcess(session, trimmed, { imagePaths });
+      const result = await this.#startResumeProcess(session, attachmentPrompt, { imagePaths });
       return {
         ...result,
         acceptedAt: nowIso(),

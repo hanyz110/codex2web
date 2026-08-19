@@ -87,8 +87,9 @@ const quickCommandButton = document.querySelector("#quickCommandButton");
 const quickCommandMenu = document.querySelector("#quickCommandMenu");
 const quickCommandItems = document.querySelectorAll("[data-quick-command]");
 const attachImageButton = document.querySelector("#attachImageButton");
-const imageInput = document.querySelector("#imageInput");
-const imagePreviewList = document.querySelector("#imagePreviewList");
+const attachmentInput = document.querySelector("#attachmentInput");
+const attachmentPreviewList = document.querySelector("#attachmentPreviewList");
+const quickAttachFilesButton = document.querySelector("#quickAttachFilesButton");
 
 const badgeElements = {
   attach: document.querySelector("#attachBadge"),
@@ -147,7 +148,10 @@ const DRAWER_GESTURE_CLOSE_RATIO = 0.32;
 const DRAWER_GESTURE_FAST_VELOCITY = 0.42;
 const DRAWER_GESTURE_FAST_MIN_DELTA_X = 36;
 const OPTIMISTIC_MESSAGE_TTL_MS = 45000;
+const MAX_ATTACHMENT_COUNT = 10;
 const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_TOTAL_BYTES = 12 * 1024 * 1024;
 const IMAGE_COMPRESS_TARGET_BYTES = 4.5 * 1024 * 1024;
@@ -158,7 +162,7 @@ let operationLoadingCount = 0;
 let bootStage = "恢复会话";
 let alertAutoHideTimerId = 0;
 let drawerGesture = null;
-let pendingImages = [];
+let pendingAttachments = [];
 
 function createClientId() {
   if (window.crypto?.randomUUID) {
@@ -1156,108 +1160,134 @@ async function compressImageFile(file, targetBytes = IMAGE_COMPRESS_TARGET_BYTES
   }
 }
 
-function renderImagePreviewList() {
-  if (!imagePreviewList) {
+function renderAttachmentPreviewList() {
+  if (!attachmentPreviewList) {
     return;
   }
 
-  imagePreviewList.innerHTML = "";
-  imagePreviewList.hidden = pendingImages.length === 0;
+  attachmentPreviewList.innerHTML = "";
+  attachmentPreviewList.hidden = pendingAttachments.length === 0;
 
-  for (const image of pendingImages) {
+  for (const attachment of pendingAttachments) {
     const item = document.createElement("div");
-    item.className = "image-preview-item";
+    item.className = "attachment-preview-item";
 
-    const img = document.createElement("img");
-    img.src = image.previewUrl;
-    img.alt = image.name ? `待发送图片：${image.name}` : "待发送图片";
-    img.loading = "lazy";
+    if (attachment.kind === "image") {
+      const img = document.createElement("img");
+      img.src = attachment.previewUrl;
+      img.alt = attachment.name ? `待发送图片：${attachment.name}` : "待发送图片";
+      img.loading = "lazy";
+      item.append(img);
+    } else {
+      const icon = document.createElement("span");
+      icon.className = "attachment-preview-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = "文件";
+      item.append(icon);
+    }
 
     const meta = document.createElement("span");
-    meta.className = "image-preview-meta";
-    meta.textContent = image.compressed
-      ? `${image.name || "图片"} · ${formatBytes(image.originalSize)}→${formatBytes(image.size)}`
-      : `${image.name || "图片"} · ${formatBytes(image.size)}`;
+    meta.className = "attachment-preview-meta";
+    meta.textContent = attachment.compressed
+      ? `${attachment.name || "图片"} · ${formatBytes(attachment.originalSize)}→${formatBytes(attachment.size)}`
+      : `${attachment.name || "文件"} · ${formatBytes(attachment.size)}`;
 
     const removeButton = document.createElement("button");
-    removeButton.className = "image-preview-remove";
+    removeButton.className = "attachment-preview-remove";
     removeButton.type = "button";
-    removeButton.setAttribute("aria-label", `移除图片 ${image.name || ""}`.trim());
-    removeButton.dataset.imageId = image.id;
+    removeButton.setAttribute("aria-label", `移除附件 ${attachment.name || ""}`.trim());
+    removeButton.dataset.attachmentId = attachment.id;
     removeButton.textContent = "×";
 
-    item.append(img, meta, removeButton);
-    imagePreviewList.append(item);
+    item.append(meta, removeButton);
+    attachmentPreviewList.append(item);
   }
 
   syncComposerOffset();
 }
 
-function clearPendingImages() {
-  for (const image of pendingImages) {
-    if (image.previewUrl) {
-      URL.revokeObjectURL(image.previewUrl);
+function clearPendingAttachments() {
+  for (const attachment of pendingAttachments) {
+    if (attachment.previewUrl) {
+      URL.revokeObjectURL(attachment.previewUrl);
     }
   }
-  pendingImages = [];
-  if (imageInput) {
-    imageInput.value = "";
+  pendingAttachments = [];
+  if (attachmentInput) {
+    attachmentInput.value = "";
   }
-  renderImagePreviewList();
+  renderAttachmentPreviewList();
 }
 
-function removePendingImage(imageId) {
-  const target = pendingImages.find((image) => image.id === imageId);
+function removePendingAttachment(imageId) {
+  const target = pendingAttachments.find((attachment) => attachment.id === imageId);
   if (target?.previewUrl) {
     URL.revokeObjectURL(target.previewUrl);
   }
-  pendingImages = pendingImages.filter((image) => image.id !== imageId);
-  renderImagePreviewList();
+  pendingAttachments = pendingAttachments.filter((attachment) => attachment.id !== imageId);
+  renderAttachmentPreviewList();
 }
 
-async function addPendingImages(files) {
+async function addPendingFiles(files) {
   const candidates = Array.from(files || []);
   if (candidates.length === 0) {
     return;
   }
 
-  const availableSlots = MAX_IMAGE_ATTACHMENTS - pendingImages.length;
+  const availableSlots = MAX_ATTACHMENT_COUNT - pendingAttachments.length;
   if (availableSlots <= 0) {
-    setAlert(`最多一次发送 ${String(MAX_IMAGE_ATTACHMENTS)} 张图片。`);
+    setAlert(`最多一次发送 ${String(MAX_ATTACHMENT_COUNT)} 个附件。`);
     return;
   }
 
   const accepted = [];
   for (const file of candidates.slice(0, availableSlots)) {
-    if (!SUPPORTED_IMAGE_TYPES.has(file.type)) {
-      setAlert("仅支持 PNG、JPEG、WebP、GIF 图片。");
-      continue;
-    }
-
     if (file.size <= 0) {
-      setAlert("图片文件为空，请换一张图片。");
+      setAlert(`文件 ${file.name || "附件"} 为空，请换一个文件。`);
       continue;
     }
-
+    if (file.size > MAX_FILE_BYTES) {
+      setAlert(`文件 ${file.name || "附件"} 超过 20MB，已忽略。`);
+      continue;
+    }
     accepted.push(file);
   }
 
   if (candidates.length > availableSlots) {
-    setAlert(`最多一次发送 ${String(MAX_IMAGE_ATTACHMENTS)} 张图片，已忽略超出的图片。`);
+    setAlert(`最多一次发送 ${String(MAX_ATTACHMENT_COUNT)} 个附件，已忽略超出的文件。`);
   }
 
   let compressedCount = 0;
   for (const file of accepted) {
-    const currentTotalBytes = pendingImages.reduce((sum, image) => sum + image.size, 0);
-    const remainingTotalBytes = Math.max(256 * 1024, MAX_IMAGE_TOTAL_BYTES - currentTotalBytes);
-    const targetBytes = Math.min(IMAGE_COMPRESS_TARGET_BYTES, remainingTotalBytes);
-    const prepared = await compressImageFile(file, targetBytes);
+    const currentTotalBytes = pendingAttachments.reduce((sum, attachment) => sum + attachment.size, 0);
+    const currentImageBytes = pendingAttachments
+      .filter((attachment) => attachment.kind === "image")
+      .reduce((sum, attachment) => sum + attachment.size, 0);
+    if (currentTotalBytes + file.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+      setAlert("附件总大小不能超过 50MB，请减少文件数量后重试。");
+      continue;
+    }
 
-    if (prepared.blob.size > MAX_IMAGE_BYTES || currentTotalBytes + prepared.blob.size > MAX_IMAGE_TOTAL_BYTES) {
-      const retryTarget = Math.min(MAX_IMAGE_BYTES, Math.max(256 * 1024, MAX_IMAGE_TOTAL_BYTES - currentTotalBytes));
+    const isImage = SUPPORTED_IMAGE_TYPES.has(file.type);
+    if (isImage && pendingAttachments.filter((attachment) => attachment.kind === "image").length >= MAX_IMAGE_ATTACHMENTS) {
+      setAlert(`最多一次发送 ${String(MAX_IMAGE_ATTACHMENTS)} 张图片。`);
+      continue;
+    }
+    const remainingImageBytes = Math.max(256 * 1024, MAX_IMAGE_TOTAL_BYTES - pendingAttachments
+      .filter((attachment) => attachment.kind === "image")
+      .reduce((sum, attachment) => sum + attachment.size, 0));
+    const prepared = isImage
+      ? await compressImageFile(file, Math.min(IMAGE_COMPRESS_TARGET_BYTES, remainingImageBytes))
+      : { blob: file, compressed: false, name: file.name || "attachment", originalSize: file.size, type: file.type || "application/octet-stream" };
+
+    if (isImage && (prepared.blob.size > MAX_IMAGE_BYTES || currentTotalBytes + prepared.blob.size > MAX_TOTAL_ATTACHMENT_BYTES || currentImageBytes + prepared.blob.size > MAX_IMAGE_TOTAL_BYTES)) {
+      const retryTarget = Math.min(
+        MAX_IMAGE_BYTES,
+        Math.max(256 * 1024, Math.min(MAX_TOTAL_ATTACHMENT_BYTES - currentTotalBytes, MAX_IMAGE_TOTAL_BYTES - currentImageBytes)),
+      );
       const retried = await compressImageFile(prepared.blob, retryTarget);
-      if (retried.blob.size > MAX_IMAGE_BYTES || currentTotalBytes + retried.blob.size > MAX_IMAGE_TOTAL_BYTES) {
-        setAlert("图片已尝试压缩，但仍超过本次可发送容量，请减少图片数量后重试。");
+      if (retried.blob.size > MAX_IMAGE_BYTES || currentTotalBytes + retried.blob.size > MAX_TOTAL_ATTACHMENT_BYTES || currentImageBytes + retried.blob.size > MAX_IMAGE_TOTAL_BYTES) {
+        setAlert("附件已尝试压缩，但仍超过本次可发送容量，请减少附件数量后重试。");
         continue;
       }
       prepared.blob = retried.blob;
@@ -1271,21 +1301,22 @@ async function addPendingImages(files) {
     if (prepared.compressed) {
       compressedCount += 1;
     }
-    pendingImages.push({
+    pendingAttachments.push({
       data: base64,
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      kind: isImage ? "image" : "file",
       compressed: prepared.compressed,
       name: prepared.name,
       originalSize: prepared.originalSize,
-      previewUrl: URL.createObjectURL(prepared.blob),
+      previewUrl: isImage ? URL.createObjectURL(prepared.blob) : "",
       size: prepared.blob.size,
       type: prepared.type,
     });
   }
 
   if (accepted.length > 0) {
-    setAlert(compressedCount > 0 ? `已自动压缩 ${String(compressedCount)} 张图片，可与文字一起发送。` : "");
-    renderImagePreviewList();
+    setAlert(compressedCount > 0 ? `已自动压缩 ${String(compressedCount)} 张图片，可与文件一起发送。` : "");
+    renderAttachmentPreviewList();
   }
 }
 
@@ -2673,34 +2704,66 @@ quickCommandMenu?.addEventListener("click", (event) => {
 });
 
 attachImageButton?.addEventListener("click", () => {
-  imageInput?.click();
+  attachmentInput?.click();
 });
 
-imageInput?.addEventListener("change", async () => {
+quickAttachFilesButton?.addEventListener("click", () => {
+  setQuickCommandMenu(false);
+  attachmentInput?.click();
+});
+
+attachmentInput?.addEventListener("change", async () => {
   try {
-    await addPendingImages(imageInput.files);
+    await addPendingFiles(attachmentInput.files);
   } catch (error) {
-    setAlert(error.message || "图片添加失败。");
+    setAlert(error.message || "附件添加失败。");
   } finally {
-    if (imageInput) {
-      imageInput.value = "";
+    if (attachmentInput) {
+      attachmentInput.value = "";
     }
   }
 });
 
-imagePreviewList?.addEventListener("click", (event) => {
+attachmentPreviewList?.addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) {
     return;
   }
 
-  const removeButton = target.closest("[data-image-id]");
+  const removeButton = target.closest("[data-attachment-id]");
   if (!(removeButton instanceof HTMLElement)) {
     return;
   }
 
-  removePendingImage(removeButton.dataset.imageId || "");
+  removePendingAttachment(removeButton.dataset.attachmentId || "");
 });
+
+const attachmentDropTarget = mainContent || composerShell;
+
+for (const eventName of ["dragenter", "dragover"]) {
+  attachmentDropTarget?.addEventListener(eventName, (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) {
+      return;
+    }
+    event.preventDefault();
+    composerShell.classList.add("is-drag-over");
+  });
+}
+
+for (const eventName of ["dragleave", "drop"]) {
+  attachmentDropTarget?.addEventListener(eventName, (event) => {
+    if (eventName === "drop") {
+      event.preventDefault();
+    }
+    if (eventName === "dragleave" && event.relatedTarget instanceof Node && attachmentDropTarget.contains(event.relatedTarget)) {
+      return;
+    }
+    composerShell.classList.remove("is-drag-over");
+    if (eventName === "drop") {
+      void addPendingFiles(event.dataTransfer?.files);
+    }
+  });
+}
 
 document.addEventListener("click", (event) => {
   const target = event.target;
@@ -2966,12 +3029,12 @@ async function sendCurrentMessage() {
   }
 
   state.send = "sending";
-  const imagesForSend = pendingImages.map((image) => ({
-    data: image.data,
-    name: image.name,
-    type: image.type,
+  const attachmentsForSend = pendingAttachments.map((attachment) => ({
+    data: attachment.data,
+    name: attachment.name,
+    type: attachment.type,
   }));
-  const optimisticMessageId = appendOptimisticUserMessage(value, { imageCount: imagesForSend.length });
+  const optimisticMessageId = appendOptimisticUserMessage(value, { imageCount: attachmentsForSend.length });
   composerInput.value = "";
   autoResizeComposer();
   state.executionState = {
@@ -2991,14 +3054,14 @@ async function sendCurrentMessage() {
   try {
     await requestJson("/api/session/send", {
       body: JSON.stringify({
-        images: imagesForSend,
+        attachments: attachmentsForSend,
         message: value,
       }),
       headers: { "content-type": "application/json" },
       method: "POST",
     });
     await syncBindingSnapshot({ silent: true });
-    clearPendingImages();
+    clearPendingAttachments();
   } catch (error) {
     removeOptimisticMessage(optimisticMessageId);
     composerInput.value = value;
