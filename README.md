@@ -31,6 +31,7 @@ Codex2Web is useful if you want:
 6. HTTP Basic Auth protection for external access
 7. optional `remote-trusted` mode for local-equivalent dangerous execution on remote browsers
 8. image + text prompt sending through Codex CLI image attachments
+9. automatic full-history Web continuation when Codex Desktop holds the selected task's writer lock
 
 ## Requirements
 
@@ -81,6 +82,8 @@ npm run external:trusted -- --port 4422
 3. `src/server/public/` contains the browser UI
 4. `scripts/external-access.mjs` starts an external-mode server and launches a tunnel
 
+Recent Codex versions allow only one active writer per task. If Codex Desktop currently owns the selected task, Codex2Web uses the official app-server `thread/fork` API to create a full-history Web continuation, persists the mapping, retries the original prompt, and reuses that continuation on later sends. The source task remains unchanged, and technical continuation tasks are hidden from the Codex2Web session catalog. Live lock files are never removed or bypassed.
+
 ## Execution Profiles
 
 Codex2Web makes browser execution policy explicit.
@@ -112,6 +115,12 @@ Limits:
 5. maximum total image size per send: 12MB
 
 Attachments are stored locally under `.codex2web/uploads/`. Images are passed to Codex CLI with `--image <file>`; other files are referenced by their private local path in the prompt. They are not committed to git because `.codex2web/` is ignored.
+
+## File Downloads
+
+Files generated inside the current session project can be downloaded directly from an AI response. The response must use an explicit Markdown link with an absolute local path, for example `[下载报表](</absolute/project/path/季度 报表.xlsx>)`.
+
+Downloads support any regular file type, including PDF, Excel, Word, PowerPoint, images, archives, Markdown, and source files. Before the browser starts a native streaming download, Codex2Web validates that the real file path remains inside the project bound to the current browser session. Plain paths and paths inside inline code are not automatically converted into download links.
 
 ## External Access
 

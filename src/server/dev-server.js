@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { createReadStream } from "node:fs";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { BridgeError, LocalSessionBridge } from "./local-bridge.js";
 import {
@@ -19,6 +21,7 @@ import {
   decodeBase64Data,
   sanitizeAttachmentName,
 } from "./attachments.js";
+import { FileDownloadError, buildDownloadHeaders, resolveDownloadFile } from "./file-download.js";
 
 const port = Number(process.env.PORT || "4321");
 const host = process.env.HOST || "127.0.0.1";
@@ -33,6 +36,7 @@ const projectRoot = fileURLToPath(new URL("../../", import.meta.url));
 const publicDir = fileURLToPath(new URL("./public/", import.meta.url));
 const auditFilePath = path.join(projectRoot, ".codex2web", "session-audit.jsonl");
 const clientSessionPinsFilePath = path.join(projectRoot, ".codex2web", "client-session-pins.json");
+const sessionForksFilePath = path.join(projectRoot, ".codex2web", "session-forks.json");
 const stateFilePath = path.join(projectRoot, ".codex2web", "session-pin.json");
 const defaultCodexBinaryPath = path.join(os.homedir(), ".bun", "bin", "codex");
 const authEnabled = basicAuthUser.length > 0 && basicAuthPass.length > 0;
@@ -117,6 +121,7 @@ const bridge = new LocalSessionBridge({
   codexBinaryPath,
   executionPolicy,
   projectPath: projectRoot,
+  sessionForksFilePath,
   stateFilePath,
 });
 await bridge.init();
@@ -378,7 +383,7 @@ async function persistAttachments(attachments, legacyImages, projectPath = proje
 }
 
 function toErrorPayload(error) {
-  if (error instanceof BridgeError) {
+  if (error instanceof BridgeError || error instanceof FileDownloadError) {
     return {
       error: {
         code: error.code,
@@ -409,6 +414,32 @@ async function handleApi(req, res, parsedUrl) {
   const clientSessionId = getClientPinnedSessionId(clientId);
 
   try {
+    if ((method === "GET" || method === "HEAD") && pathname === "/api/session/file") {
+      await bridge.discoverSessions();
+      const binding = bridge.getBinding(clientSessionId);
+      const sessionProjectPath = binding.session?.projectPath || "";
+      if (!sessionProjectPath) {
+        throw new FileDownloadError(
+          409,
+          "当前客户端没有绑定可下载文件的会话。",
+          "DOWNLOAD_SESSION_UNAVAILABLE",
+        );
+      }
+
+      const file = await resolveDownloadFile({
+        projectPath: sessionProjectPath,
+        requestedPath: parsedUrl.searchParams.get("path") || "",
+      });
+      res.writeHead(200, buildDownloadHeaders(file));
+      if (method === "HEAD") {
+        res.end();
+        return;
+      }
+
+      await pipeline(createReadStream(file.filePath), res);
+      return;
+    }
+
     if (method === "GET" && pathname === "/api/sessions") {
       const sessions = await bridge.discoverSessions();
       sendJson(res, 200, {
@@ -515,6 +546,10 @@ async function handleApi(req, res, parsedUrl) {
         imagePaths,
         sessionId: clientSessionId,
       });
+      if (clientId && result.sessionId && result.sessionId !== clientSessionId) {
+        clientSessionPins.set(clientId, result.sessionId);
+        await persistClientSessionPins();
+      }
       sendJson(res, 200, { ok: true, result });
       return;
     }
@@ -608,8 +643,12 @@ async function handleApi(req, res, parsedUrl) {
       ok: false,
     });
   } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error instanceof Error ? error : undefined);
+      return;
+    }
     const payload = toErrorPayload(error);
-    const statusCode = error instanceof BridgeError ? error.statusCode : 500;
+    const statusCode = error instanceof BridgeError || error instanceof FileDownloadError ? error.statusCode : 500;
     sendJson(res, statusCode, payload);
   }
 }

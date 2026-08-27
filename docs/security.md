@@ -28,6 +28,17 @@ Codex2Web is safe by default only when used as intended:
 2. do not reuse passwords from other services
 3. rotate after demos or temporary phone access sessions
 
+## File Download Boundary
+
+The authenticated download endpoint is scoped to the project of the session selected by the current browser client.
+
+1. only absolute paths are accepted
+2. both the project root and requested file are resolved with `realpath`
+3. files outside the project, including symlink escapes, are rejected
+4. directories and non-regular files are rejected
+5. downloads are streamed and returned with `Content-Disposition: attachment` and `no-store`
+6. file extensions are not restricted; PDF, Office files, images, archives, and other regular files use the same validation
+
 ## Operational Advice
 
 1. treat `remote-trusted` as local shell-equivalent authority

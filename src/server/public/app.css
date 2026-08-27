@@ -877,6 +877,33 @@ h3 {
   color: #0b3a9a;
 }
 
+.local-file-download {
+  display: inline-flex;
+  align-items: baseline;
+  max-width: 100%;
+  gap: 4px;
+  cursor: pointer;
+  vertical-align: baseline;
+}
+
+.local-file-download > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.local-file-download-icon {
+  flex: 0 0 auto;
+  font-weight: 700;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.local-file-download[data-download-state="loading"] {
+  cursor: progress;
+  opacity: 0.6;
+  pointer-events: none;
+}
+
 .message.user .inline-code {
   background: rgba(15, 23, 42, 0.08);
 }

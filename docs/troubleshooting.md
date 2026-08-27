@@ -51,6 +51,32 @@ Typical causes:
 2. session attach failed
 3. a previous execution is still running or stopping
 
+## Generated file cannot be downloaded
+
+The AI response must contain a Markdown link whose target is an absolute path inside the current session project. Paths shown as plain text or inline code are intentionally not made clickable.
+
+Typical errors:
+
+1. `400`: the path is relative, points to a directory, or is otherwise invalid
+2. `403`: the file or a symlink target is outside the current session project
+3. `404`: the file was deleted, renamed, or moved
+4. `409`: this browser has no usable session project binding
+
+Useful local check:
+
+```bash
+curl -I -u '<user>:<pass>' \
+  'http://127.0.0.1:4422/api/session/file?clientId=<client-id>&path=<url-encoded-absolute-path>'
+```
+
+## Error: thread already has an active writer
+
+Recent Codex versions prevent two processes from writing the same task at the same time. This happens when the desktop app-server owns a task and an older Codex2Web version starts a separate `codex exec resume` process for it.
+
+Codex2Web now handles this globally. It detects the active writer, creates a Web continuation through the official `thread/fork` API with the complete finished history, persists the mapping, switches the browser binding, and retries the original message. Technical continuation tasks are hidden from the Codex2Web session catalog.
+
+Do not delete lock files. Removing a live lock can allow concurrent writes and corrupt the task. If automatic continuation fails, verify that the configured Codex binary supports `codex app-server` and restart the external service.
+
 ## Message sent but the session appears stuck
 
 Codex2Web tracks the child `codex exec resume` process for each sent prompt.

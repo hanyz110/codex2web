@@ -1,3 +1,5 @@
+import { buildSessionFileUrl, replaceMarkdownLinks } from "./file-links.js";
+
 const state = {
   attach: "error",
   auditTrail: [],
@@ -588,24 +590,39 @@ function escapeHtml(text) {
 
 function formatInlineMarkdown(text) {
   const inlineCodeTokens = new Map();
-  let formatted = escapeHtml(text).replace(/`([^`]+)`/g, (_, code) => {
+  let formatted = String(text || "").replace(/`([^`]+)`/g, (_, code) => {
     const token = `@@CODE_${inlineCodeTokens.size}@@`;
     inlineCodeTokens.set(token, `<code class="inline-code">${escapeHtml(code)}</code>`);
     return token;
   });
 
   const markdownLinkTokens = new Map();
-  formatted = formatted.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
+  formatted = replaceMarkdownLinks(formatted, ({ kind, label, match, target }) => {
+    if (kind === "unsupported") {
+      return match;
+    }
+
     const token = `@@LINK_${markdownLinkTokens.size}@@`;
-    const safeUrl = escapeHtml(url);
-    markdownLinkTokens.set(
-      token,
-      `<a class="inline-link" href="${safeUrl}" target="_blank" rel="noopener noreferrer">${label}</a>`,
-    );
+    const safeLabel = escapeHtml(label);
+    if (kind === "local-file") {
+      const safeUrl = escapeHtml(buildSessionFileUrl(target, clientId));
+      markdownLinkTokens.set(token, [
+        `<a class="inline-link local-file-download" href="${safeUrl}" data-local-file-download>`,
+        '<span class="local-file-download-icon" aria-hidden="true">&#8595;</span>',
+        `<span>${safeLabel}</span>`,
+        "</a>",
+      ].join(""));
+    } else {
+      const safeUrl = escapeHtml(target);
+      markdownLinkTokens.set(
+        token,
+        `<a class="inline-link" href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeLabel}</a>`,
+      );
+    }
     return token;
   });
 
-  formatted = formatted
+  formatted = escapeHtml(formatted)
     .replace(/\bhttps?:\/\/[^\s<)]+/g, (url) => {
       const safeUrl = escapeHtml(url);
       return `<a class="inline-link" href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeUrl}</a>`;
@@ -621,6 +638,62 @@ function formatInlineMarkdown(text) {
   }
 
   return formatted;
+}
+
+function downloadPreflightError(statusCode) {
+  if (statusCode === 400) {
+    return "下载目标不是有效的项目文件。";
+  }
+  if (statusCode === 403) {
+    return "该文件不在当前会话的项目目录内，无法下载。";
+  }
+  if (statusCode === 404) {
+    return "文件不存在或已被移动。";
+  }
+  if (statusCode === 409) {
+    return "当前页面尚未绑定可下载文件的会话，请刷新后重试。";
+  }
+  if (statusCode === 401) {
+    return "下载鉴权已失效，请刷新页面并重新登录。";
+  }
+  return `下载检查失败（HTTP ${String(statusCode)}）。`;
+}
+
+async function startLocalFileDownload(link) {
+  if (link.dataset.downloadState === "loading") {
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  link.dataset.downloadState = "loading";
+  link.setAttribute("aria-disabled", "true");
+  try {
+    const response = await fetch(resolveApiUrl(link.href), {
+      cache: "no-store",
+      credentials: "include",
+      headers: { "x-codex2web-client-id": clientId },
+      method: "HEAD",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(downloadPreflightError(response.status));
+    }
+
+    const downloadLink = document.createElement("a");
+    downloadLink.href = link.href;
+    downloadLink.hidden = true;
+    document.body.append(downloadLink);
+    downloadLink.click();
+    downloadLink.remove();
+    setAlert("");
+  } catch (error) {
+    setAlert(error?.name === "AbortError" ? "下载检查超时，请重试。" : error?.message || "文件下载失败，请重试。");
+  } finally {
+    window.clearTimeout(timeoutId);
+    delete link.dataset.downloadState;
+    link.removeAttribute("aria-disabled");
+  }
 }
 
 function renderTextBlocks(text) {
@@ -2242,16 +2315,18 @@ function removeOptimisticMessage(messageId) {
 
 async function requestJson(url, options) {
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutMs = Number(options?.timeoutMs) > 0 ? Number(options.timeoutMs) : REQUEST_TIMEOUT_MS;
+  const { timeoutMs: _timeoutMs, ...fetchOptions } = options || {};
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
   const requestUrl = resolveApiUrl(url);
 
   try {
     const response = await fetch(requestUrl, {
-      ...options,
+      ...fetchOptions,
       cache: "no-store",
       credentials: "include",
       headers: {
-        ...(options?.headers || {}),
+        ...(fetchOptions.headers || {}),
         "x-codex2web-client-id": clientId,
       },
       signal: controller.signal,
@@ -2618,6 +2693,13 @@ transcriptList?.addEventListener("scroll", () => {
 transcriptList?.addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof Element)) {
+    return;
+  }
+
+  const downloadLink = target.closest("[data-local-file-download]");
+  if (downloadLink instanceof HTMLAnchorElement) {
+    event.preventDefault();
+    await startLocalFileDownload(downloadLink);
     return;
   }
 
@@ -3052,16 +3134,20 @@ async function sendCurrentMessage() {
   setAlert("");
 
   try {
-    await requestJson("/api/session/send", {
+    const payload = await requestJson("/api/session/send", {
       body: JSON.stringify({
         attachments: attachmentsForSend,
         message: value,
       }),
       headers: { "content-type": "application/json" },
       method: "POST",
+      timeoutMs: 60000,
     });
     await syncBindingSnapshot({ silent: true });
     clearPendingAttachments();
+    if (payload.result?.autoForked) {
+      setAlert("检测到桌面端正在使用原会话，已自动复制完整上下文并切换到 Web 续接会话。原指令已继续执行。");
+    }
   } catch (error) {
     removeOptimisticMessage(optimisticMessageId);
     composerInput.value = value;

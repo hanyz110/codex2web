@@ -4,6 +4,17 @@ import { existsSync } from "node:fs";
 import { appendFile, mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+  forkCodexThread,
+  isThreadActiveWriterConflict,
+  isThreadWriterLockHeld,
+} from "./codex-app-server.js";
+import {
+  collectMappedForkSessionIds,
+  parseSessionForkMappings,
+  resolveMappedSessionId,
+  serializeSessionForkMappings,
+} from "./session-forks.js";
 
 export function getDefaultCodexBinaryCandidates(homeDir = os.homedir()) {
   return [
@@ -19,7 +30,7 @@ const FIRST_JSONL_RECORD_READ_BYTES = 64 * 1024;
 const TRANSCRIPT_TAIL_INITIAL_READ_BYTES = 512 * 1024;
 const TRANSCRIPT_TAIL_MAX_READ_BYTES = 24 * 1024 * 1024;
 const MAX_TRANSPORT_ERROR_DETAIL_CHARS = 1200;
-const SEND_ACCEPT_TIMEOUT_MS = 1500;
+const SEND_START_TIMEOUT_MS = 30000;
 const STOP_ESCALATION_TIMEOUT_MS = 3000;
 const STOP_STATUS_RESET_MS = 6000;
 const SESSION_POLL_INTERVAL_MS = 1200;
@@ -476,6 +487,8 @@ export class LocalSessionBridge {
   #stopStatusResetTimers = new Map();
   #sessionCursors = new Map();
   #sessionIndexPath;
+  #sessionForkMappings = new Map();
+  #sessionForksFilePath;
   #sessionFileInfoCache = new Map();
   #sessionRootPath;
   #sessions = [];
@@ -483,7 +496,7 @@ export class LocalSessionBridge {
   #stateFilePath;
   #transcriptCache = new Map();
 
-  constructor({ auditFilePath, codexBinaryPath, executionPolicy, projectPath, stateFilePath }) {
+  constructor({ auditFilePath, codexBinaryPath, executionPolicy, projectPath, sessionForksFilePath, stateFilePath }) {
     this.#auditFilePath = auditFilePath;
     this.#codexBinaryPath = normalizePath(codexBinaryPath) || resolveDefaultCodexBinary();
     this.#executionPolicy = {
@@ -496,10 +509,12 @@ export class LocalSessionBridge {
     this.#projectPath = normalizePath(projectPath);
     this.#sessionIndexPath = path.join(os.homedir(), ".codex", "session_index.jsonl");
     this.#sessionRootPath = path.join(os.homedir(), ".codex", "sessions");
+    this.#sessionForksFilePath = sessionForksFilePath || path.join(path.dirname(stateFilePath), "session-forks.json");
     this.#stateFilePath = stateFilePath;
   }
 
   async init() {
+    await this.#loadSessionForkMappings();
     await this.#refreshSessions(true);
     const persistedSessionId = await this.#readPersistedSessionId();
     const hasPersistedPin = this.#sessionsById.has(persistedSessionId);
@@ -530,7 +545,10 @@ export class LocalSessionBridge {
 
   async discoverSessions() {
     await this.#refreshSessions();
-    return this.#sessions.map((session) => this.#toPublicSession(session));
+    const hiddenForkSessionIds = collectMappedForkSessionIds(this.#sessionForkMappings);
+    return this.#sessions
+      .filter((session) => !hiddenForkSessionIds.has(session.id))
+      .map((session) => this.#toPublicSession(session));
   }
 
   getFailureModes() {
@@ -778,8 +796,9 @@ export class LocalSessionBridge {
   }
 
   getBinding(sessionId = this.#pinnedSessionId) {
-    const effectiveSessionId = trimText(sessionId) || this.#pinnedSessionId;
-    const session = this.#getSession(effectiveSessionId);
+    const requestedSessionId = trimText(sessionId) || this.#pinnedSessionId;
+    const session = this.#getSession(requestedSessionId);
+    const effectiveSessionId = session?.id || requestedSessionId;
     const connection = this.#failureModes.connection ? "error" : "connected";
     const attach = this.#failureModes.attach || !session ? "error" : "attached";
     const stream = this.#failureModes.connection ? "idle" : "streaming";
@@ -823,10 +842,11 @@ export class LocalSessionBridge {
     if (!session) {
       return [];
     }
+    const effectiveSessionId = session.id;
 
-    const cachedTranscript = this.#transcriptCache.get(sessionId);
-    const cachedCursor = this.#sessionCursors.get(sessionId);
-    const cachedFileInfo = this.#sessionFileInfoCache.get(sessionId);
+    const cachedTranscript = this.#transcriptCache.get(effectiveSessionId);
+    const cachedCursor = this.#sessionCursors.get(effectiveSessionId);
+    const cachedFileInfo = this.#sessionFileInfoCache.get(effectiveSessionId);
     if (cachedTranscript && cachedCursor && cachedFileInfo) {
       try {
         const fileInfo = await stat(session.filePath);
@@ -844,10 +864,10 @@ export class LocalSessionBridge {
     }
 
     const { cursor, transcript } = await parseTranscriptFile(session);
-    this.#sessionCursors.set(sessionId, cursor);
-    this.#transcriptCache.set(sessionId, transcript);
+    this.#sessionCursors.set(effectiveSessionId, cursor);
+    this.#transcriptCache.set(effectiveSessionId, transcript);
     const fileInfo = await stat(session.filePath);
-    this.#sessionFileInfoCache.set(sessionId, {
+    this.#sessionFileInfoCache.set(effectiveSessionId, {
       mtimeMs: fileInfo.mtimeMs,
       size: fileInfo.size,
     });
@@ -859,13 +879,17 @@ export class LocalSessionBridge {
       return [];
     }
 
-    await this.#pollSessionById(sessionId);
-    const transcript = this.#transcriptCache.get(sessionId);
+    const session = this.#getSession(sessionId);
+    if (!session) {
+      return [];
+    }
+    await this.#pollSessionById(session.id);
+    const transcript = this.#transcriptCache.get(session.id);
     if (transcript) {
       return transcript.map((entry) => ({ ...entry }));
     }
 
-    return this.getTranscript(sessionId);
+    return this.getTranscript(session.id);
   }
 
   async getTranscriptSnapshot({ afterId = "", forceFull = false, sessionId = this.#pinnedSessionId } = {}) {
@@ -886,8 +910,9 @@ export class LocalSessionBridge {
         reset: false,
       };
     }
+    const effectiveSessionId = session.id;
 
-    let transcript = await this.refreshTranscriptCache(sessionId);
+    const transcript = await this.refreshTranscriptCache(effectiveSessionId);
 
     const latestEntryId = transcript.at(-1)?.id || null;
     if (forceFull || !afterId) {
@@ -932,9 +957,10 @@ export class LocalSessionBridge {
         oldestEntryId: null,
       };
     }
+    const effectiveSessionId = session.id;
 
     const safeLimit = Math.max(1, Math.min(200, Number.isFinite(Number(limit)) ? Math.floor(Number(limit)) : 80));
-    const visibleTranscript = this.#transcriptCache.get(sessionId) || (await this.getTranscript(sessionId));
+    const visibleTranscript = this.#transcriptCache.get(effectiveSessionId) || (await this.getTranscript(effectiveSessionId));
     const visibleAnchor = visibleTranscript.find((entry) => entry.id === beforeId) || { id: beforeId };
     const { transcript } = await parseTranscriptFile(session, { limit: HISTORY_TRANSCRIPT_LIMIT });
     const anchorIndex = findTranscriptAnchorIndex(transcript, visibleAnchor);
@@ -1011,7 +1037,7 @@ export class LocalSessionBridge {
 
     await this.#refreshSessions(true);
     const targetSessionId = trimText(options?.sessionId) || this.#pinnedSessionId;
-    const session = this.#getSession(targetSessionId);
+    let session = this.#getSession(targetSessionId);
     if (this.#failureModes.attach || !session) {
       throw new BridgeError(409, "Pinned session is not attached.", "SESSION_ATTACH_ERROR");
     }
@@ -1032,6 +1058,14 @@ export class LocalSessionBridge {
       );
     }
 
+    let autoForked = false;
+    let sourceSessionId = null;
+    if (isThreadWriterLockHeld(session.id)) {
+      sourceSessionId = session.id;
+      session = await this.#createWebContinuationSession(session);
+      autoForked = true;
+    }
+
     this.#setStopStatus(session.id, "idle");
     this.#setExecutionState(session.id, {
       acceptedAt: null,
@@ -1042,7 +1076,9 @@ export class LocalSessionBridge {
       processAlive: false,
       startedAt: nowIso(),
       statusDetail:
-        imagePaths.length > 0
+        autoForked
+          ? "检测到桌面端正在使用原会话，已复制完整上下文并发送到 Web 续接会话。"
+          : imagePaths.length > 0
           ? `指令已发送，已附加 ${String(imagePaths.length)} 张图片，正在启动 Codex 执行。`
           : "指令已发送，正在启动 Codex 执行。",
     }, { emit: false });
@@ -1050,11 +1086,47 @@ export class LocalSessionBridge {
     this.#emit("state", this.getBinding());
 
     try {
-      const result = await this.#startResumeProcess(session, attachmentPrompt, { imagePaths });
+      let result;
+      try {
+        result = await this.#startResumeProcess(session, attachmentPrompt, { imagePaths });
+      } catch (error) {
+        if (!(error instanceof BridgeError) || error.code !== "THREAD_ACTIVE_WRITER") {
+          throw error;
+        }
+
+        sourceSessionId = session.id;
+        this.#sendingSessionIds.delete(session.id);
+        this.#setExecutionState(session.id, {
+          exitCode: error.statusCode,
+          lastActivityAt: nowIso(),
+          phase: "idle",
+          processAlive: false,
+          statusDetail: "检测到桌面端正在使用原会话，正在自动创建 Web 续接会话。",
+        }, { emit: false });
+        session = await this.#createWebContinuationSession(session);
+        autoForked = true;
+        this.#setStopStatus(session.id, "idle");
+        this.#setExecutionState(session.id, {
+          acceptedAt: null,
+          exitCode: null,
+          lastActivityAt: nowIso(),
+          lastVisibleMessageAt: null,
+          phase: "starting",
+          processAlive: false,
+          startedAt: nowIso(),
+          statusDetail: "已复制完整会话上下文，正在重新发送原指令。",
+        }, { emit: false });
+        this.#sendingSessionIds.add(session.id);
+        this.#emit("state", this.getBinding(session.id));
+        result = await this.#startResumeProcess(session, attachmentPrompt, { imagePaths });
+      }
+
       return {
         ...result,
         acceptedAt: nowIso(),
+        autoForked,
         imageCount: imagePaths.length,
+        sourceSessionId,
       };
     } catch (error) {
       this.#sendingSessionIds.delete(session.id);
@@ -1122,6 +1194,7 @@ export class LocalSessionBridge {
 
   async #startResumeProcess(session, prompt, { imagePaths = [] } = {}) {
     let accepted = false;
+    let failed = false;
     let timeoutId = null;
     let stderrText = "";
 
@@ -1193,7 +1266,11 @@ export class LocalSessionBridge {
         resolve({ imageCount: imagePaths.length, sessionId: session.id });
       };
 
-      const fail = (message) => {
+      const fail = (message, errorCode = "SEND_FAILED") => {
+        if (failed) {
+          return;
+        }
+        failed = true;
         if (runContext.stopRequested) {
           if (!accepted) {
             accept();
@@ -1221,12 +1298,15 @@ export class LocalSessionBridge {
           statusDetail: message,
         }, { emit: false });
         this.#emit("state", this.getBinding());
-        reject(new BridgeError(502, message, "SEND_FAILED"));
+        reject(new BridgeError(502, message, errorCode));
       };
 
       timeoutId = setTimeout(() => {
-        accept();
-      }, SEND_ACCEPT_TIMEOUT_MS);
+        if (child.exitCode == null) {
+          child.kill("SIGTERM");
+        }
+        fail("Codex 执行进程启动超时，未确认接收指令。", "SEND_START_TIMEOUT");
+      }, SEND_START_TIMEOUT_MS);
 
       child.on("error", (error) => {
         clearTimeout(timeoutId);
@@ -1319,12 +1399,62 @@ export class LocalSessionBridge {
           return;
         }
 
-        fail(formatTransportExitMessage(code, stderrText));
+        const message = formatTransportExitMessage(code, stderrText);
+        fail(
+          message,
+          isThreadActiveWriterConflict(stderrText) ? "THREAD_ACTIVE_WRITER" : "SEND_FAILED",
+        );
       });
 
       child.stdin.write(prompt);
       child.stdin.end();
     });
+  }
+
+  async #createWebContinuationSession(sourceSession) {
+    let fork;
+    try {
+      fork = await forkCodexThread({
+        codexBinaryPath: this.#codexBinaryPath,
+        executionPolicy: this.#executionPolicy,
+        session: sourceSession,
+      });
+    } catch (error) {
+      throw new BridgeError(
+        502,
+        `检测到桌面端正在使用原会话，但自动创建 Web 续接会话失败：${String(error.message || error)}`,
+        "WEB_CONTINUATION_FAILED",
+      );
+    }
+
+    this.#sessionForkMappings.set(sourceSession.id, fork.sessionId);
+    await this.#persistSessionForkMappings();
+    await this.#refreshSessions(true);
+    const continuationSession = this.#sessionsById.get(fork.sessionId);
+    if (!continuationSession) {
+      throw new BridgeError(
+        502,
+        "Web 续接会话已经创建，但本地会话索引尚未发现它，请重试。",
+        "WEB_CONTINUATION_NOT_DISCOVERED",
+      );
+    }
+
+    if (this.#pinnedSessionId === sourceSession.id) {
+      this.#pinnedSessionId = continuationSession.id;
+      await this.#persistPinnedSessionId();
+    }
+    this.#recordAudit({
+      action: "session_auto_fork",
+      detail: "Detected a Codex active-writer conflict and created a Web continuation with the complete thread history.",
+      nextSessionId: continuationSession.id,
+      prevSessionId: sourceSession.id,
+    });
+    this.#emit("pinned", {
+      pinnedSessionId: continuationSession.id,
+      session: this.#toPublicSession(continuationSession),
+      updatedAt: nowIso(),
+    });
+    return continuationSession;
   }
 
   async #refreshSessions(force = false) {
@@ -1507,7 +1637,12 @@ export class LocalSessionBridge {
       return null;
     }
 
-    return this.#sessionsById.get(sessionId) || null;
+    const resolvedSessionId = resolveMappedSessionId(
+      sessionId,
+      this.#sessionForkMappings,
+      new Set(this.#sessionsById.keys()),
+    );
+    return this.#sessionsById.get(resolvedSessionId) || this.#sessionsById.get(sessionId) || null;
   }
 
   #toPublicSession(session) {
@@ -1537,6 +1672,18 @@ export class LocalSessionBridge {
     await writeFile(this.#stateFilePath, payload, "utf-8");
   }
 
+  async #persistSessionForkMappings() {
+    if (!this.#sessionForksFilePath) {
+      return;
+    }
+    await mkdir(path.dirname(this.#sessionForksFilePath), { recursive: true });
+    await writeFile(
+      this.#sessionForksFilePath,
+      JSON.stringify(serializeSessionForkMappings(this.#sessionForkMappings), null, 2),
+      "utf-8",
+    );
+  }
+
   async #persistAuditEntry(entry) {
     try {
       if (!this.#auditFilePath) {
@@ -1564,5 +1711,19 @@ export class LocalSessionBridge {
     }
 
     return null;
+  }
+
+  async #loadSessionForkMappings() {
+    if (!this.#sessionForksFilePath) {
+      return;
+    }
+    try {
+      const payload = JSON.parse(await readFile(this.#sessionForksFilePath, "utf-8"));
+      this.#sessionForkMappings = parseSessionForkMappings(payload);
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+        process.stderr.write(`Failed to load Web continuation mappings: ${String(error)}\n`);
+      }
+    }
   }
 }
